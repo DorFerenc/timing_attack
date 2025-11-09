@@ -4,28 +4,14 @@ import time
 import json
 from datetime import datetime
 from pathlib import Path
-import yaml
-from dotenv import load_dotenv
 
-from core.exceptions import TimingAttackException, ConfigurationError
-from services.http_service import HttpClient
-from services.analysis_service import AnalysisService
-from services.timing_service import TimingService, SamplingStrategy
-from attack.timing_attacker import TimingAttacker, AttackConfig
-from utils.logger import Logger
+from http_client import HttpClient
+from timing import TimingService, AnalysisService, SamplingStrategy
+from attack import TimingAttacker, AttackConfig
+from utils import Logger, load_config, TimingAttackException, ConfigurationError
 
 
 RESULTS_FILE = "attack_results.json"
-
-
-def load_config(config_path: str = "config/config.yaml") -> dict:
-    try:
-        with open(config_path, 'r') as f:
-            return yaml.safe_load(f)
-    except FileNotFoundError:
-        raise ConfigurationError(f"Config file not found: {config_path}")
-    except yaml.YAMLError as e:
-        raise ConfigurationError(f"Invalid YAML config: {str(e)}")
 
 
 def save_result(username: str, password: str, elapsed_time: float, difficulty: int):
@@ -96,15 +82,15 @@ def view_history():
 
 
 def run_attack(config: dict, logger: Logger):
-    username = os.environ.get('TARGET_USERNAME')
-    if not username:
+    username = config['target_username']
+    if not username or username == 'your_id_here':
         username = input("Enter target username: ").strip()
         if not username:
             print("Username required!")
             return
 
-    difficulty = int(os.environ.get('ATTACK_DIFFICULTY', config['attack']['difficulty']))
-    max_length = int(os.environ.get('MAX_PASSWORD_LENGTH', config['attack']['max_password_length']))
+    difficulty = config['difficulty']
+    max_length = config['max_length']
 
     print(f"\n{'='*60}")
     print("Starting Timing Attack")
@@ -115,44 +101,43 @@ def run_attack(config: dict, logger: Logger):
     print(f"{'='*60}\n")
 
     # Determine server URL
-    use_local = os.environ.get('USE_LOCAL_SERVER', 'true').lower() == 'true'
-    base_url = config['server']['base_url'] if use_local else config['server']['remote_url']
+    base_url = "http://127.0.0.1/" if config['use_local_server'] else "http://aoi-assignment1.oy.ne.ro:8080/"
 
     logger.info(f"Server: {base_url}")
 
     # Initialize components
     http_client = HttpClient(
         base_url=base_url,
-        timeout=config['server']['timeout'],
-        max_retries=config['server']['max_retries'],
-        pool_size=config['performance']['pool_size'],
+        timeout=config['server_timeout'],
+        max_retries=config['server_max_retries'],
+        pool_size=config['pool_size'],
         logger=logger
     )
 
     timing_analyzer = AnalysisService(
-        confidence_level=config['attack']['thresholds']['confidence_level'],
-        min_time_difference=config['attack']['thresholds']['min_time_difference'],
-        outlier_threshold=config['attack']['thresholds']['outlier_std_dev'],
+        confidence_level=config['confidence_level'],
+        min_time_difference=config['min_time_difference'],
+        outlier_threshold=config['outlier_std_dev'],
         logger=logger
     )
 
     sampling_strategy = SamplingStrategy(
-        initial_samples=config['attack']['timing']['initial_samples'],
-        middle_samples=config['attack']['timing']['middle_samples'],
-        final_samples=config['attack']['timing']['final_samples'],
-        min_samples=config['attack']['timing']['min_samples']
+        initial_samples=config['initial_samples'],
+        middle_samples=config['middle_samples'],
+        final_samples=config['final_samples'],
+        min_samples=config['min_samples']
     )
 
     timing_service = TimingService(
         http_client=http_client,
         sampling_strategy=sampling_strategy,
         logger=logger,
-        use_parallel=config['performance']['parallel_requests'],
-        max_workers=config['performance']['max_workers']
+        use_parallel=config['parallel_requests'],
+        max_workers=config['max_workers']
     )
 
     attack_config = AttackConfig(
-        charset=config['attack']['charset'],
+        charset=config['charset'],
         max_length=max_length,
         verify_each_char=True
     )
@@ -224,15 +209,14 @@ def show_menu():
 
 
 def main():
-    load_dotenv()
-
     try:
-        config = load_config()
+        config = load_config()  # This loads .env automatically
+        # Initialize logger
+        log_file = config['log_file'] if config['log_to_file'] else None
         logger = Logger(
             name="TimingAttack",
-            level=os.environ.get('LOG_LEVEL', config['logging']['level']),
-            log_file=config['logging'].get('file'),
-            console=config['logging']['console']
+            level=config['log_level'],
+            log_file=log_file
         )
 
         while True:

@@ -1,38 +1,43 @@
 """
-HTTP communication service for password verification requests.
-
-Implements IHttpClient interface with connection pooling and retry logic.
-
-Author: Your Name
-Date: 2025
+HTTP Client: Network communication with timing measurements.
+Simplified version without interfaces.
 """
 
 import time
+from dataclasses import dataclass
 from typing import Optional
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from core.interfaces import IHttpClient, TimingMeasurement
-from core.exceptions import ConnectionFailedException
-from utils.logger import Logger
+from utils import Logger, ConnectionFailedException
 
 
-class HttpClient(IHttpClient):
+# ============================================
+# DATA CLASSES
+# ============================================
+
+@dataclass
+class TimingMeasurement:
+    """Result from a single timing measurement."""
+    password: str
+    elapsed_time: float
+    success: bool = True
+    is_correct: bool = False
+
+
+# ============================================
+# HTTP CLIENT
+# ============================================
+
+class HttpClient:
     """
-    Robust HTTP client with connection pooling and automatic retries.
+    HTTP client with connection pooling and precise timing.
 
     Features:
-    - Connection pooling for better performance
-    - Automatic retry with exponential backoff
-    - Precise timing measurements
-    - Resource cleanup
-
-    Example:
-        >>> client = HttpClient("http://example.com", timeout=10)
-        >>> measurement = client.send_request("password123", "user", 1)
-        >>> print(f"Took {measurement.elapsed_time:.3f} seconds")
-        >>> client.close()
+    - Connection pooling for performance
+    - Automatic retries with exponential backoff
+    - Precise timing using perf_counter
     """
 
     def __init__(
@@ -43,16 +48,6 @@ class HttpClient(IHttpClient):
         pool_size: int = 10,
         logger: Optional[Logger] = None
     ):
-        """
-        Initialize HTTP client.
-
-        Args:
-            base_url: Base URL of the target server
-            timeout: Request timeout in seconds
-            max_retries: Maximum number of retry attempts
-            pool_size: Size of connection pool
-            logger: Optional logger instance
-        """
         self.base_url = base_url.rstrip('/')
         self.timeout = timeout
         self.logger = logger or Logger()
@@ -61,12 +56,11 @@ class HttpClient(IHttpClient):
         self.session = requests.Session()
 
         # Configure retry strategy
-        # Note: method_whitelist was renamed to allowed_methods in urllib3 2.0+
         retry_strategy = Retry(
             total=max_retries,
-            backoff_factor=0.3,  # Wait 0.3s, 0.6s, 1.2s between retries
+            backoff_factor=0.3,
             status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"]  # Changed from method_whitelist
+            allowed_methods=["GET"]
         )
 
         adapter = HTTPAdapter(
@@ -87,18 +81,15 @@ class HttpClient(IHttpClient):
         difficulty: int
     ) -> TimingMeasurement:
         """
-        Send a password verification request with precise timing.
+        Send password verification request with precise timing.
 
         Args:
-            password: Password candidate to test
-            username: Username for authentication
+            password: Password to test
+            username: Username
             difficulty: Difficulty level
 
         Returns:
-            TimingMeasurement object with timing and result data
-
-        Raises:
-            ConnectionFailedException: If unable to connect after retries
+            TimingMeasurement with timing data
         """
         params = {
             'user': username,
@@ -107,7 +98,7 @@ class HttpClient(IHttpClient):
         }
 
         try:
-            # Use perf_counter for precise timing (unaffected by system clock changes)
+            # Precise timing (unaffected by system clock changes)
             start_time = time.perf_counter()
 
             response = self.session.get(
@@ -118,7 +109,7 @@ class HttpClient(IHttpClient):
 
             elapsed_time = time.perf_counter() - start_time
 
-            # Check if password is correct (server returns "1")
+            # Server returns "1" if password is correct
             is_correct = response.text.strip() == '1'
 
             self.logger.debug(
@@ -145,7 +136,7 @@ class HttpClient(IHttpClient):
             self.logger.error(f"Request failed: {str(e)}")
             raise ConnectionFailedException(self.base_url, str(e))
 
-    def close(self) -> None:
+    def close(self):
         """Clean up session and release resources."""
         self.session.close()
         self.logger.info("HTTP client closed")

