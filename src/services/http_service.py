@@ -13,9 +13,9 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from src.core.interfaces import IHttpClient, TimingMeasurement
-from src.core.exceptions import ConnectionFailedException
-from src.utils.logger import Logger
+from core.interfaces import IHttpClient, TimingMeasurement
+from core.exceptions import ConnectionFailedException
+from utils.logger import Logger
 
 
 class HttpClient(IHttpClient):
@@ -61,11 +61,12 @@ class HttpClient(IHttpClient):
         self.session = requests.Session()
 
         # Configure retry strategy
+        # Note: method_whitelist was renamed to allowed_methods in urllib3 2.0+
         retry_strategy = Retry(
             total=max_retries,
             backoff_factor=0.3,  # Wait 0.3s, 0.6s, 1.2s between retries
             status_forcelist=[429, 500, 502, 503, 504],
-            method_whitelist=["GET"]
+            allowed_methods=["GET"]  # Changed from method_whitelist
         )
 
         adapter = HTTPAdapter(

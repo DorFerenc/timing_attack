@@ -10,14 +10,14 @@ Date: 2025
 import statistics
 from typing import List, Tuple
 
-from src.core.interfaces import ITimingAnalyzer, TimingMeasurement, CharacterAnalysis
-from src.utils.stats import (
+from core.interfaces import ITimingAnalyzer, TimingMeasurement, CharacterAnalysis
+from utils.stats import (
     remove_outliers,
     calculate_confidence_interval,
     is_significantly_different,
     median_absolute_deviation
 )
-from src.utils.logger import Logger
+from utils.logger import Logger
 
 
 class AnalysisService(ITimingAnalyzer):
@@ -240,7 +240,7 @@ class AnalysisService(ITimingAnalyzer):
             time_diff = best.median_time - second_best.median_time
             self.logger.info(
                 f"Runner-up: '{second_best.character}' "
-                f"({second_best.median_time:.6f}s, Δ={time_diff:.6f}s)"
+                f"({second_best.median_time:.6f}s, diff={time_diff:.6f}s)"
             )
 
             # Check if difference is significant

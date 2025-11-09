@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from src.core.interfaces import ILogger
+from core.interfaces import ILogger
 
 
 class Logger(ILogger):
@@ -51,9 +51,17 @@ class Logger(ILogger):
             datefmt='%Y-%m-%d %H:%M:%S'
         )
 
-        # Console handler
+        # Console handler with UTF-8 encoding support
         if console:
-            console_handler = logging.StreamHandler(sys.stdout)
+            # Force UTF-8 encoding for console output to handle Unicode characters
+            import io
+            utf8_stdout = io.TextIOWrapper(
+                sys.stdout.buffer,
+                encoding='utf-8',
+                errors='replace',  # Replace unencodable characters
+                line_buffering=True
+            )
+            console_handler = logging.StreamHandler(utf8_stdout)
             console_handler.setFormatter(formatter)
             self.logger.addHandler(console_handler)
 

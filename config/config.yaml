@@ -3,9 +3,15 @@
 
 # Server Configuration
 server:
-  # Use environment variable for production
+  # Local server URLs (non-Docker)
   base_url: "http://127.0.0.1/"
+
+  # Remote server URL
   remote_url: "http://aoi-assignment1.oy.ne.ro:8080/"
+
+  # Docker Compose server URL (when running in containers)
+  docker_url: "http://vulnerable-server:8080/"
+
   timeout: 10
   max_retries: 3
 
@@ -15,12 +21,12 @@ attack:
   max_password_length: 32
   charset: "abcdefghijklmnopqrstuvwxyz"
 
-  # Timing parameters
+  # Timing parameters (optimized for speed)
   timing:
-    initial_samples: 20      # Samples for first 3 characters
-    middle_samples: 15       # Samples for chars 4-8
-    final_samples: 10        # Samples for chars 9+
-    min_samples: 5           # Minimum samples
+    initial_samples: 10      # Samples for first 3 characters (reduced from 20)
+    middle_samples: 8        # Samples for chars 4-8 (reduced from 15)
+    final_samples: 5         # Samples for chars 9+ (reduced from 10)
+    min_samples: 3           # Minimum samples (reduced from 5)
 
   # Statistical thresholds
   thresholds:
@@ -32,8 +38,8 @@ attack:
 performance:
   use_connection_pool: true
   pool_size: 10
-  parallel_requests: false   # Set true for milestone 2
-  max_workers: 5
+  parallel_requests: true    # ENABLED for faster performance
+  max_workers: 10            # Increased from 5 to 10 workers
 
 # Logging
 logging:
