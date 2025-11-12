@@ -6,107 +6,113 @@ import requests
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-WORKERS = 13
-SAMPLES = 12
+MAX_SAMPLES = 15
+MIN_SAMPLES = 4
 # URL = "http://127.0.0.1/?user=316279942&password=baaaaaaaaaaaaaaa&difficulty=1"
-URL = "http://aoi-assignment1.oy.ne.ro:8080/?user=316279942&password=baaaaaaaaaaaaaaa&difficulty=1"
+# URL = "http://aoi-assignment1.oy.ne.ro:8080/?user=316279942&password=baaaaaaaaaaaaaaa&difficulty=1"
+URL = "http://aoi-assignment1.oy.ne.ro:8080/?user=208145268&password=ndbmitipwidpnlll&difficulty=1"
 
-def test_sequential(url, samples=SAMPLES):
-    """Collect samples sequentially"""
+def test_sequential(url, samples, max_retries=3):
+    """Collect samples sequentially with retry and skip on failure"""
     total = 0.0
+    success_count = 0
     for _ in range(samples):
-        response = requests.get(url)
-        total += response.elapsed.total_seconds()
-    return total / samples
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, timeout=5)
+                total += response.elapsed.total_seconds()
+                success_count += 1
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"[Sequential] Sample failed after {max_retries} attempts: {e}")
+    if success_count == 0:
+        return 0.0
+    return total / success_count
 
-def test_parallel(url, samples=SAMPLES, workers=WORKERS):
-    """Collect samples in parallel"""
+def test_parallel(url, samples, workers, max_retries=3):
+    """Collect samples in parallel with retry and skip on failure"""
     total = 0.0
+    success_count = 0
+    def safe_request():
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, timeout=5)
+                return response.elapsed.total_seconds()
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"[Parallel] Sample failed after {max_retries} attempts: {e}")
+        return None
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(requests.get, url) for _ in range(samples)]
+        futures = [executor.submit(safe_request) for _ in range(samples)]
         for future in as_completed(futures):
-            response = future.result()
-            total += response.elapsed.total_seconds()
-    return total / samples
+            result = future.result()
+            if result is not None:
+                total += result
+                success_count += 1
+    if success_count == 0:
+        return 0.0
+    return total / success_count
 
-def main():
 
-
+def auto_search_best_config():
     print("=" * 60)
-    print("Testing timing measurement methods")
+    print("Auto-searching best SAMPLES and WORKERS configuration...")
     print("=" * 60)
+    SAFETY_THRESHOLD = 0.1  # 10% difference
+    results = []
 
     # Warmup
     print("\nWarmup...")
     for _ in range(3):
         requests.get(URL)
 
-    # Sequential test
-    print(f"\nSequential sample collection ({SAMPLES} samples):")
-    start = time.time()
-    avg_seq = test_sequential(URL, samples=SAMPLES)
-    seq_elapsed = time.time() - start
-    print(f"  Average response time: {avg_seq:.6f}s")
-    print(f"  Total measurement time: {seq_elapsed:.2f}s")
+    for samples in range(MIN_SAMPLES, MAX_SAMPLES + 1):
+        for workers in range(1, samples + 1):
+            # Sequential
+            start = time.time()
+            avg_seq = test_sequential(URL, samples)
+            seq_elapsed = time.time() - start
+            # Parallel
+            start = time.time()
+            avg_par = test_parallel(URL, samples, workers)
+            par_elapsed = time.time() - start
+            timing_diff = abs(avg_seq - avg_par)
+            timing_diff_pct = timing_diff / avg_seq * 100 if avg_seq else 0
+            is_safe = timing_diff / avg_seq < SAFETY_THRESHOLD if avg_seq else False
+            speedup = seq_elapsed / par_elapsed if par_elapsed else 0
+            efficiency = speedup / workers * 100 if workers else 0
+            results.append({
+                "samples": samples,
+                "workers": workers,
+                "avg_seq": avg_seq,
+                "avg_par": avg_par,
+                "seq_elapsed": seq_elapsed,
+                "par_elapsed": par_elapsed,
+                "timing_diff_pct": timing_diff_pct,
+                "is_safe": is_safe,
+                "speedup": speedup,
+                "efficiency": efficiency
+            })
+            print(f"Tested: samples={samples}, workers={workers} | safe={'✓' if is_safe else '✗'} | speedup={speedup:.2f}x | efficiency={efficiency:.1f}% | diff={timing_diff_pct:.1f}%")
 
-    # Parallel test with workers
-    print(f"\nParallel sample collection ({SAMPLES} samples, {WORKERS} workers):")
-    start = time.time()
-    avg_par = test_parallel(URL, samples=SAMPLES, workers=WORKERS)
-    par_elapsed = time.time() - start
-    print(f"  Average response time: {avg_par:.6f}s")
-    print(f"  Total measurement time: {par_elapsed:.2f}s")
-    print(f"  Speedup: {seq_elapsed/par_elapsed:.2f}x")
-
-    # Result comparison
-    print("\n" + "=" * 60)
-    print("ANALYSIS")
-    print("=" * 60)
-
-    timing_diff = abs(avg_seq - avg_par)
-    timing_diff_pct = timing_diff / avg_seq * 100
-    print(f"\nTiming difference: {timing_diff:.6f}s ({timing_diff_pct:.1f}%)")
-
-    # Safety check (accuracy)
-    SAFETY_THRESHOLD = 0.1  # 10% difference
-    is_safe = timing_diff / avg_seq < SAFETY_THRESHOLD
-    print(f"\nSafety (accuracy): {'✓ PASS' if is_safe else '✗ FAIL'}")
-    if is_safe:
-        print(f"  Parallel results are within {SAFETY_THRESHOLD*100:.0f}% of sequential")
+    # Find best config: safe, highest speedup
+    safe_results = [r for r in results if r["is_safe"]]
+    if safe_results:
+        best = max(safe_results, key=lambda r: r["speedup"])
+        print("\n" + "=" * 60)
+        print("BEST CONFIGURATION (safe & fastest)")
+        print("=" * 60)
+        print(f"Samples: {best['samples']}")
+        print(f"Workers: {best['workers']}")
+        print(f"Speedup: {best['speedup']:.2f}x")
+        print(f"Efficiency: {best['efficiency']:.1f}%")
+        print(f"Timing diff: {best['timing_diff_pct']:.1f}%")
+        print(f"Sequential time: {best['seq_elapsed']:.2f}s")
+        print(f"Parallel time: {best['par_elapsed']:.2f}s")
+        print("=" * 60)
     else:
-        print(f"  Parallel results differ by {timing_diff_pct:.1f}% - too much variance!")
-
-    # Performance check (speed)
-    speedup = seq_elapsed / par_elapsed
-    efficiency = speedup / WORKERS * 100
-    print(f"\nPerformance (speed): {speedup:.2f}x speedup")
-    print(f"  Parallel time: {par_elapsed:.2f}s")
-    print(f"  Sequential time: {seq_elapsed:.2f}s")
-    print(f"  Efficiency: {efficiency:.1f}% (ideal: 100%)")
-
-    # Overall recommendation
-    print("\n" + "=" * 60)
-    print("RECOMMENDATION")
-    print("=" * 60)
-
-    if is_safe and speedup > 1.5:
-        print(f"✓ USE PARALLEL MODE")
-        print(f"  - Results are accurate (within {SAFETY_THRESHOLD*100:.0f}% threshold)")
-        print(f"  - Performance is {speedup:.2f}x faster than sequential")
-    elif is_safe and speedup >= 1.0:
-        print(f"~ PARALLEL IS SAFE BUT OFFERS LIMITED SPEEDUP")
-        print(f"  - Results are accurate (within {SAFETY_THRESHOLD*100:.0f}% threshold)")
-        print(f"  - Only {speedup:.2f}x faster - overhead may not justify complexity")
-    elif is_safe:
-        print(f"~ USE SEQUENTIAL MODE")
-        print(f"  - Results are accurate")
-        print(f"  - Parallel is slower ({speedup:.2f}x) - overhead exceeds benefits")
-    else:
-        print(f"✗ USE SEQUENTIAL MODE")
-        print(f"  - Parallel results are unreliable (differ by {timing_diff_pct:.1f}%)")
-        print(f"  - Accuracy is more important than speed")
-
-    print("=" * 60)
+        print("No safe configuration found (all parallel results differ too much from sequential)")
 
 if __name__ == "__main__":
-    main()
+    auto_search_best_config()
